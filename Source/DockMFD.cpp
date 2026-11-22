@@ -6,7 +6,6 @@
 // Flow:  pick target (UP/DN/SEL)  ->  PLN (plan: burn 1, coast, burn 2)  ->  ENG twice (confirm)  ->
 //        calibrate RCS -> burn 1 -> coast with mid-course corrections -> braking burn -> closing -> docking funnel -> docked.
 #define STRICT
-#define NOMINMAX
 #define ORBITER_MODULE
 #include "Orbitersdk.h"
 #include "DrawAPI.h"
