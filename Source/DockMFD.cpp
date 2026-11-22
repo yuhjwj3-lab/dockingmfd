@@ -79,7 +79,7 @@ struct Auto {
     OBJHANDLE hCh = NULL, hTgt = NULL, hRef = NULL;
     int cPort = 0, tPort = 0;
     double standoff = 2000.0;
-    bool fast = false, autoWarp = false;
+    bool fast = false, autoWarp = true;
     char msg[120] = "SELECT A TARGET";
     char tgtName[40] = "";
     std::vector<Cand> cands;
@@ -727,7 +727,7 @@ static void step(double simt, double dt)
     double wa = warpAllowed();
     double cur = oapiGetTimeAcceleration();
     if (cur > wa + 1e-6) oapiSetTimeAcceleration((std::max)(1.0, wa));
-    else if (A.autoWarp && cur < wa * 0.5) oapiSetTimeAcceleration((std::min)(wa, 1000.0));
+    else if (A.autoWarp && wa > 1.5 && cur < wa * 0.9) oapiSetTimeAcceleration((std::min)(wa, 10000.0));
 
     // flight log
     if (simt - A.logT >= 2.0) {
@@ -741,15 +741,16 @@ static double warpAllowed()
 {
     double t = oapiGetSimTime();
     switch (A.ph) {
-    case PH_COAST: return (std::max)(1.0, (A.tIgn1 - 100.0 - t) / 25.0);
+    case PH_COAST: return (std::max)(1.0, (A.tIgn1 - 100.0 - t) / 10.0);
     case PH_TRANSIT: {
         double ev = (std::min)(A.nextMcc, A.tArr - 0.5 * A.tb2 - 120.0);
-        return (std::max)(1.0, (ev - t) / 25.0); }
+        return (std::max)(1.0, (ev - t) / 10.0); }
     case PH_NEAR: {
         double s = fabs(A.S.s);
-        if (A.S.range > 3000.0) return 10.0;
-        if (s > 400.0) return 4.0;
-        if (s > 80.0) return 2.0;
+        if (A.S.range > 3000.0) return 30.0;
+        if (s > 400.0) return 10.0;
+        if (s > 80.0) return 4.0;
+        if (s > 25.0) return 2.0;
         return 1.0; }
     case PH_PLANNING: case PH_READY: case PH_IDLE: case PH_DOCKED: case PH_ABORT: return 1e9;
     default: return 1.0;
@@ -799,122 +800,158 @@ static void fmtTime(char *b, double s)
     else snprintf(b, 24, "%dm%02ds", t / 60, t % 60);
 }
 
+static const DWORD C_ACC2 = RGB(0, 230, 0);      // accent (rules, header), different from ARLC's all-green look
+static const char *PAGES[4] = { "TARGET", "PLAN", "FLIGHT", "CORRIDOR" };
+
 class DOCK_MFD : public MFD2 {
 public:
-    DOCK_MFD(DWORD w, DWORD h, VESSEL *v) : MFD2(w, h, v), page(-1)
+    DOCK_MFD(DWORD w, DWORD h, VESSEL *v) : MFD2(w, h, v), page(-1), lastCat(-1), lh(14), x0(6), y(4)
     {
-        fMed = oapiCreateFont((int)(h / 19), true, "Arial", FONT_NORMAL);
-        fLab = oapiCreateFont((int)(h / 22), true, "Arial", FONT_NORMAL);
-        fBig = oapiCreateFont((int)(h / 13), true, "Arial", FONT_NORMAL);
-        bgB = oapiCreateBrush(C_BG); bandB = oapiCreateBrush(C_BAND); selB = oapiCreateBrush(RGB(0, 45, 0));
-        penLine = oapiCreatePen(1, 1, C_LINE);
+        font = oapiCreateFont((int)(h / 28), true, "Courier New");
+        penR = oapiCreatePen(1, 1, RGB(0, 120, 0)); penG = oapiCreatePen(1, 1, RGB(0, 120, 0));
+        penA = oapiCreatePen(1, 1, C_AMBER); penV = oapiCreatePen(1, 2, C_VAL); penRed = oapiCreatePen(1, 1, C_RED);
     }
     ~DOCK_MFD()
     {
-        oapiReleaseFont(fMed); oapiReleaseFont(fLab); oapiReleaseFont(fBig);
-        oapiReleaseBrush(bgB); oapiReleaseBrush(bandB); oapiReleaseBrush(selB); oapiReleasePen(penLine);
+        oapiReleaseFont(font); oapiReleasePen(penR); oapiReleasePen(penG); oapiReleasePen(penA); oapiReleasePen(penV); oapiReleasePen(penRed);
     }
-    void Txt(oapi::Sketchpad *s, oapi::Font *f, DWORD col, int x, int yy, const char *t, bool right = false)
+    int Category() const { return (A.ph >= PH_CAL && A.ph <= PH_DOCKED) ? 2 : ((A.ph == PH_READY || A.ph == PH_PLANNING) ? 1 : 0); }
+    int ActivePage()
     {
-        s->SetFont(f); s->SetTextColor(col);
-        s->SetTextAlign(right ? oapi::Sketchpad::RIGHT : oapi::Sketchpad::LEFT);
-        s->Text(x, yy, t, (int)strlen(t));
-        s->SetTextAlign(oapi::Sketchpad::LEFT);
+        int cat = Category();
+        if (cat != lastCat) { lastCat = cat; page = -1; }
+        return page >= 0 ? page : cat;
     }
-    void Row(oapi::Sketchpad *s, const char *k, const char *v, DWORD vc = C_VAL)
+    void KV(oapi::Sketchpad *s, const char *k, const char *v, DWORD vc = C_VAL)
     {
-        Txt(s, fLab, C_LAB, pad, y, k);
-        Txt(s, fMed, vc, W - pad, y - 1, v, true);
-        y += rowH;
-        s->SetPen(penLine); s->MoveTo(pad, y - 3); s->LineTo(W - pad, y - 3);
+        int cx = (int)(W * 0.42);
+        s->SetTextColor(RGB(0, 120, 0)); s->Text(x0, y, k, (int)strlen(k));
+        s->SetTextColor(vc); s->Text(cx, y, v, (int)strlen(v)); y += lh;
     }
-    int ActivePage() const
+    void Line(oapi::Sketchpad *s, DWORD col, const char *fmt, ...)
     {
-        if (page >= 0) return page;
-        return (A.ph >= PH_CAL && A.ph < PH_DOCKED) || A.ph == PH_DOCKED ? 1 : 0;
+        char b[200]; va_list ap; va_start(ap, fmt); vsnprintf(b, 199, fmt, ap); va_end(ap);
+        s->SetTextColor(col); s->Text(x0, y, b, (int)strlen(b)); y += lh;
     }
     bool Update(oapi::Sketchpad *skp)
     {
         double now = oapiGetSimTime();
         if (now - A.candT > 1.0 || now < A.candT) { A.candT = now; if (A.ph < PH_PLANNING || A.ph == PH_READY) refreshCands(); }
-        pad = (int)(W * 0.035); rowH = (int)(H / 14.5);
-        skp->SetBackgroundMode(oapi::Sketchpad::BK_TRANSPARENT);
-        skp->SetBrush(bgB); skp->SetPen(NULL); skp->Rectangle(0, 0, W, H);
-        int hb = (int)(H * 0.085);
-        skp->SetBrush(bandB); skp->Rectangle(0, 0, W, hb);
-        Txt(skp, fMed, C_VAL, pad, hb / 2 - (int)(H / 19) / 2 - 1, "DOCK");
-        Txt(skp, fMed, (A.ph == PH_ABORT) ? C_RED : C_AMBER, W - pad, hb / 2 - (int)(H / 19) / 2 - 1, phaseName(A.ph), true);
-        y = hb + 6;
-        if (ActivePage() == 0) DrawSetup(skp); else DrawRun(skp);
-        // message line
-        int my = H - (int)(H * 0.075);
-        skp->SetPen(penLine); skp->MoveTo(pad, my - 3); skp->LineTo(W - pad, my - 3);
-        DWORD mc = (strstr(A.msg, "ABORT") || strstr(A.msg, "NO ") || strstr(A.msg, "NOT ") || strstr(A.msg, "LOST") || strstr(A.msg, "LOW")) ? C_RED : C_VAL;
-        Txt(skp, fLab, mc, pad, my, A.msg);
+        skp->SetFont(font); skp->SetBackgroundMode(oapi::Sketchpad::BK_TRANSPARENT);
+        lh = (int)(H / 28); x0 = 6; y = 4;
+        int pg = ActivePage();
+        char b[160];
+        skp->SetTextColor(C_ACC2); snprintf(b, 159, "DOCK  %s", PAGES[pg]); skp->Text(x0, y, b, (int)strlen(b));
+        skp->SetTextAlign(oapi::Sketchpad::RIGHT);
+        skp->SetTextColor(A.ph == PH_ABORT ? C_RED : (A.ph == PH_READY ? C_AMBER : C_VAL));
+        skp->Text(W - 6, y, phaseName(A.ph), (int)strlen(phaseName(A.ph)));
+        skp->SetTextAlign(oapi::Sketchpad::LEFT);
+        y += lh + 2; skp->SetPen(penR); skp->Line(0, y, W, y); y += 4;
+        switch (pg) { case 0: PageTarget(skp); break; case 1: PagePlan(skp); break; case 2: PageFlight(skp); break; default: PageCorridor(skp); }
+        int sy = H - lh - 3;
+        skp->SetPen(penR); skp->Line(0, sy - 2, W, sy - 2);
+        bool bad = strstr(A.msg, "ABORT") || strstr(A.msg, "NO ") || strstr(A.msg, "NOT ") || strstr(A.msg, "LOST") || strstr(A.msg, "TOO ") || strstr(A.msg, "ONLY");
+        bool warn = strstr(A.msg, "ENG") || strstr(A.msg, "PRESS");
+        skp->SetTextColor(bad ? C_RED : (warn ? C_AMBER : C_VAL));
+        int n = (int)strlen(A.msg); if (n > 62) n = 62;
+        skp->Text(x0, sy, A.msg, n);
         return true;
     }
-    void DrawSetup(oapi::Sketchpad *skp)
+    void PageTarget(oapi::Sketchpad *s)
     {
-        char b[96], d[24];
-        Txt(skp, fLab, C_LAB, pad, y, A.hTgt ? "TARGET" : "TARGETS IN THIS ORBIT");
-        if (A.hTgt) Txt(skp, fMed, C_CYAN, W - pad, y - 1, A.tgtName, true);
-        y += rowH;
+        char b[160], d[24];
+        KV(s, "TARGET", A.hTgt ? A.tgtName : "(none)", A.hTgt ? C_VAL : C_AMBER);
+        if (A.hTgt) { snprintf(b, 159, "%d -> %d", A.cPort + 1, A.tPort + 1); KV(s, "PORTS (YOU->TGT)", b); }
+        snprintf(b, 159, "%.1f km", A.standoff / 1000.0); KV(s, "STANDOFF", b);
+        KV(s, "PLAN STYLE", A.fast ? "FAST (more fuel)" : "ECONOMY (less fuel)");
+        KV(s, "AUTO WARP", A.autoWarp ? "ON" : "OFF", A.autoWarp ? C_VAL : C_AMBER);
+        y += 4;
+        s->SetTextColor(RGB(0, 120, 0)); const char *h = "  NAME              RANGE     PORTS"; s->Text(x0, y, h, (int)strlen(h)); y += lh;
+        s->SetPen(penG); s->Line(0, y, W, y); y += 3;
         int shown = 0;
-        for (size_t i = 0; i < A.cands.size() && shown < 5; i++, shown++) {
-            const Cand &c = A.cands[i];
-            bool sel = ((int)i == A.cur);
-            if (sel) { skp->SetBrush(selB); skp->SetPen(NULL); skp->Rectangle(0, y - 2, W, y + rowH - 2); }
+        for (size_t i = 0; i < A.cands.size() && shown < 8; i++, shown++) {
+            const Cand &c = A.cands[i]; bool sel = ((int)i == A.cur);
             fmtDist(d, c.dist);
-            snprintf(b, 95, "%s%.16s", sel ? "> " : "  ", c.name);
-            Txt(skp, fMed, sel ? C_AMBER : C_VAL, pad, y, b);
-            snprintf(b, 95, "%s  %d/%d", d, c.nFree, c.nTot);
-            Txt(skp, fLab, C_LAB, W - pad, y + 2, b, true);
-            y += rowH;
+            snprintf(b, 159, "%c %-16.16s %9s  %d/%d", sel ? '>' : ' ', c.name, d, c.nFree, c.nTot);
+            Line(s, sel ? C_AMBER : C_VAL, "%s", b);
         }
-        if (A.cands.empty()) { Txt(skp, fLab, C_AMBER, pad, y, "NONE (needs a free docking port)"); y += rowH; }
-        y = (int)(H * 0.092) + 6 + rowH * 7;
-        VESSEL *v = A.hCh ? chaser() : oapiGetFocusInterface();
-        VESSEL *t = target();
-        if (v && A.hTgt) {
-            snprintf(b, 95, "%d  ->  %d", A.cPort + 1, A.tPort + 1);
-            Row(skp, "PORTS (YOURS -> TARGET)", b);
-        }
-        snprintf(b, 95, "%.1f km   %s", A.standoff / 1000.0, A.fast ? "FAST" : "ECONOMY");
-        Row(skp, "STANDOFF / PLAN STYLE", b);
-        if (A.ph == PH_READY && A.closeOnly) Row(skp, "MODE", "DIRECT APPROACH", C_AMBER);
-        else if (A.ph == PH_READY && A.plan.valid) {
-            char t1[24], t2[24];
-            fmtTime(t1, A.tIgn1 - oapiGetSimTime()); fmtTime(t2, A.tArr - oapiGetSimTime());
-            snprintf(b, 95, "%.0f + %.0f = %.0f m/s", A.plan.dv1m, A.plan.dv2m, A.plan.dv1m + A.plan.dv2m);
-            Row(skp, "DELTA-V", b, (A.plan.dv1m + A.plan.dv2m > 0.9 * A.C.dvAvail) ? C_RED : C_VAL);
-            snprintf(b, 95, "%s   /   %s", t1, t2);
-            Row(skp, "BURN IN  /  ARRIVAL IN", b);
-        }
-        (void)t;
+        if (A.cands.empty()) Line(s, C_AMBER, "  none with a free docking port");
     }
-    void DrawRun(oapi::Sketchpad *skp)
+    void PagePlan(oapi::Sketchpad *s)
     {
-        char b[96], d[24], d2[24];
-        const Snap &S = A.S;
-        Txt(skp, fLab, C_LAB, pad, y, "TARGET"); Txt(skp, fMed, C_CYAN, W - pad, y - 1, A.tgtName, true); y += rowH;
-        if (A.ph == PH_DOCKED) {
-            Txt(skp, fBig, C_VAL, W / 2 - (int)(W * 0.30), y + rowH, "DOCKED");
-            return;
-        }
+        char b[160], t1[24], t2[24];
         double now = oapiGetSimTime();
-        if (A.ph <= PH_ABORT && S.ok) {
-            fmtDist(d, S.range);
-            snprintf(b, 95, "%s", d); Row(skp, "RANGE", b);
-            snprintf(b, 95, "%.2f m/s", S.closing); Row(skp, "CLOSING SPEED", b);
-            fmtDist(d, fabs(S.s)); fmtDist(d2, S.lat);
-            snprintf(b, 95, "%s  /  %s", d, d2); Row(skp, "ON-AXIS / OFF-AXIS", b, (S.lat > 0.08 * fabs(S.s) + 1.0 && S.s < 300) ? C_AMBER : C_VAL);
-            snprintf(b, 95, "%.1f deg   /   %.1f deg", A.errP * DEG2, A.errR * DEG2); Row(skp, "POINTING / ROLL ERROR", b);
+        KV(s, "TARGET", A.hTgt ? A.tgtName : "(none)", A.hTgt ? C_VAL : C_AMBER);
+        if (A.ph == PH_PLANNING) { Line(s, C_AMBER, "planning... %d%%", (int)(100.0 * A.planner.progress())); return; }
+        if (A.ph != PH_READY) { Line(s, C_AMBER, "no plan yet - press PLN"); return; }
+        if (A.closeOnly) { KV(s, "MODE", "DIRECT APPROACH", C_AMBER); return; }
+        KV(s, "MODE", A.circ ? "PREPARATORY BURN" : "RENDEZVOUS TRANSFER", A.circ ? C_AMBER : C_VAL);
+        fmtTime(t1, A.tIgn1 - now); KV(s, "BURN 1 IN", t1);
+        snprintf(b, 159, "%.0f m/s  (%.0f s burn)", A.plan.dv1m, A.tb1); KV(s, "BURN 1", b);
+        if (!A.circ) {
+            snprintf(b, 159, "%.0f m/s  (%.0f s burn)", A.plan.dv2m, A.tb2); KV(s, "BRAKING BURN", b);
+            fmtTime(t2, A.tArr - now); KV(s, "ARRIVAL IN", t2);
+            fmtTime(t2, A.plan.tof); KV(s, "TRANSFER TIME", t2);
+            snprintf(b, 159, "%d", A.plan.nrev); KV(s, "REVOLUTIONS", b);
         }
-        if (A.ph == PH_COAST || A.ph == PH_ORIENT1) { fmtTime(d, A.tIgn1 - now); Row(skp, "BURN 1 IN", d); }
-        if (A.ph >= PH_TRANSIT && A.ph <= PH_BRAKE) { fmtTime(d, A.tArr - now); Row(skp, "ARRIVAL IN", d); }
-        if (A.ph == PH_NEAR) Row(skp, "STAGE", A.sub, C_AMBER);
-        snprintf(b, 95, "%.0f x", oapiGetTimeAcceleration()); Row(skp, "TIME ACCELERATION", b);
-        snprintf(b, 95, "%.0f kg RCS  /  %.0f m/s MAIN", A.C.rcsFuel, A.C.dvAvail); Row(skp, "FUEL", b);
+        double need = A.plan.dv1m + A.plan.dv2m;
+        snprintf(b, 159, "%.0f m/s", need); KV(s, "TOTAL DELTA-V", b, need > 0.9 * A.C.dvAvail ? C_RED : C_VAL);
+        snprintf(b, 159, "%.0f m/s", A.C.dvAvail); KV(s, "MAIN DELTA-V LEFT", b);
+        y += 4;
+        Line(s, C_AMBER, "ENG twice to start");
+    }
+    void PageFlight(oapi::Sketchpad *s)
+    {
+        char b[160], d[24], d2[24];
+        const Snap &S = A.S;
+        double now = oapiGetSimTime();
+        KV(s, "TARGET", A.hTgt ? A.tgtName : "(none)", C_VAL);
+        if (A.ph == PH_DOCKED) { y += lh; Line(s, C_VAL, "DOCKED - autopilot released"); return; }
+        if (A.ph == PH_COAST || A.ph == PH_ORIENT1) { fmtTime(d, A.tIgn1 - now); KV(s, "BURN 1 IN", d, C_AMBER); }
+        if (A.ph >= PH_TRANSIT && A.ph <= PH_BRAKE) { fmtTime(d, A.tArr - now); KV(s, "ARRIVAL IN", d, C_AMBER); }
+        if (A.burnOn) { snprintf(b, 159, "%.1f m/s", burnRemaining()); KV(s, "BURN REMAINING", b, C_AMBER); }
+        if (A.ph == PH_NEAR) KV(s, "STAGE", A.sub, C_AMBER);
+        y += 3;
+        if (S.ok && A.ph >= PH_CAL) {
+            fmtDist(d, S.range); KV(s, "RANGE", d);
+            snprintf(b, 159, "%.2f m/s", S.closing); KV(s, "CLOSING SPEED", b);
+            snprintf(b, 159, "%.2f m/s", dk::len(S.rhoDot)); KV(s, "REL SPEED", b);
+            fmtDist(d, fabs(S.s)); fmtDist(d2, S.lat);
+            snprintf(b, 159, "%s", d); KV(s, "ALONG AXIS", b);
+            snprintf(b, 159, "%s", d2); KV(s, "OFF AXIS", b, (S.lat > 0.08 * fabs(S.s) + 1.0 && S.s < 300) ? C_AMBER : C_VAL);
+            snprintf(b, 159, "%.1f deg", A.errP * DEG2); KV(s, "POINTING ERR", b);
+            snprintf(b, 159, "%.1f deg", A.errR * DEG2); KV(s, "ROLL ERR", b);
+        }
+        y += 3;
+        snprintf(b, 159, "%.0f x", oapiGetTimeAcceleration()); KV(s, "TIME ACCEL", b);
+        snprintf(b, 159, "%.0f kg", A.C.rcsFuel); KV(s, "RCS FUEL", b);
+        snprintf(b, 159, "%.0f m/s", A.C.dvAvail); KV(s, "MAIN DELTA-V", b);
+    }
+    void PageCorridor(oapi::Sketchpad *s)
+    {
+        const Snap &S = A.S;
+        if (!S.ok || A.hTgt == NULL) { Line(s, C_AMBER, "no target selected"); return; }
+        int top = y + 2, bot = H - lh - 12;
+        int cx = W / 2, mh = bot - top;
+        double sm = (std::max)(30.0, (std::max)(S.s, fabs(dk::dot(S.rho, dk::unit(S.mT - S.dT * dk::dot(S.mT, S.dT)))) ) * 1.15);
+        double scale = mh / sm;
+        // side view: vertical = distance along the target port axis, horizontal = sideways offset
+        V3 ex = dk::unit(S.mT - S.dT * dk::dot(S.mT, S.dT));
+        if (dk::len(ex) < 0.5) ex = dk::unit(dk::cross(S.dT, V3(0.3, 0.5, 0.8)));
+        double side = dk::dot(S.rho, ex);
+        s->SetPen(penR); s->Line(cx, top, cx, bot);
+        s->SetPen(penG);
+        double ang = tan(35.0 * 3.14159265358979 / 180.0);
+        s->Line(cx, bot, cx - (int)(mh * ang), top); s->Line(cx, bot, cx + (int)(mh * ang), top);
+        s->SetPen(penV); s->Rectangle(cx - 8, bot, cx + 8, bot + 4);
+        int px = cx + (int)(side * scale), py = bot - (int)(S.s * scale);
+        px = (std::max)(6, (std::min)((int)W - 6, px)); py = (std::max)(top, (std::min)(bot + 6, py));
+        bool inside = S.s > 0 && S.lat < ang * S.s + 5.0;
+        s->SetPen(inside ? penV : penA); s->Rectangle(px - 4, py - 4, px + 4, py + 4);
+        s->SetTextColor(RGB(0, 120, 0)); char b[64];
+        snprintf(b, 63, "scale %.0f m", sm); s->Text(x0, top, b, (int)strlen(b));
+        s->SetTextColor(inside ? C_VAL : C_AMBER);
+        const char *m = inside ? "IN CORRIDOR" : "OUTSIDE CORRIDOR"; s->Text(x0, bot - lh, m, (int)strlen(m));
     }
     bool ConsumeButton(int bt, int ev)
     {
@@ -930,8 +967,8 @@ public:
         case 7: engage(); break;
         case 8: doAbort(); break;
         case 9: if (A.ph < PH_CAL) { A.fast = !A.fast; if (A.ph == PH_READY) A.ph = PH_IDLE; setMsg(A.fast ? "FAST PLANS: MORE DELTA-V, LESS WAITING" : "ECONOMY PLANS: LESS DELTA-V, MORE WAITING"); } break;
-        case 10: A.autoWarp = !A.autoWarp; setMsg(A.autoWarp ? "AUTO TIME-WARP ON" : "AUTO TIME-WARP OFF (WARP IS STILL LIMITED FOR SAFETY)"); break;
-        case 11: page = (ActivePage() == 0) ? 1 : 0; break;
+        case 10: A.autoWarp = !A.autoWarp; setMsg(A.autoWarp ? "AUTO TIME-WARP ON" : "AUTO TIME-WARP OFF (STILL LIMITED FOR SAFETY)"); break;
+        case 11: page = (ActivePage() + 1) % 4; break;
         default: return false;
         }
         InvalidateButtons(); InvalidateDisplay();
@@ -977,7 +1014,7 @@ public:
             { "Standoff distance", "1 / 2 / 5 km", 0 },
             { "Plan the rendezvous", 0, 'P' }, { "Engage (press twice)", 0, 'E' }, { "Abort - you get control", 0, 'A' },
             { "Plan style", "FAST = more fuel, ECO = more waiting", 0 },
-            { "Auto time-warp", "speeds up the long coasts", 'W' }, { "Page: setup / status", 0, 'G' } };
+            { "Auto time-warp", "speeds up the long coasts", 'W' }, { "Next page", 0, 'G' } };
         if (menu) *menu = m; return 12;
     }
     void WriteStatus(FILEHANDLE scn) const
@@ -996,10 +1033,9 @@ public:
         }
     }
 private:
-    int page, pad, rowH, y;
-    oapi::Font *fMed, *fLab, *fBig;
-    oapi::Brush *bgB, *bandB, *selB;
-    oapi::Pen *penLine;
+    int page, lastCat, lh, x0, y;
+    oapi::Font *font;
+    oapi::Pen *penR, *penG, *penA, *penV, *penRed;
 };
 
 static int MsgProc(UINT msg, UINT mfd, WPARAM wp, LPARAM lp)
