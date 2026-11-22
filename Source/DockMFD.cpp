@@ -399,6 +399,19 @@ static void startPlan()
             return;
         }
     }
+    {                                                     // match orbital planes first (automatic)
+        double tB, ang; V3 vN, vB;
+        if (dk::planeChange(S.rc, S.vc, S.rt, S.vt, A.mu, 240.0, tB, vN, vB, ang) && ang > 1.0) {
+            double dvp = dk::len(vN - vB);
+            if (dvp > 0.8 * A.C.dvAvail) { setMsg("PLANE CHANGE NEEDS %.0f M/S, ONLY %.0f AVAILABLE", dvp, A.C.dvAvail); return; }
+            dk::Plan pl; pl.valid = true; pl.t0 = tB; pl.tof = 0; pl.v1 = vN; pl.dv1 = vN - vB; pl.dv1m = dvp;
+            A.plan = pl; A.circ = true; A.closeOnly = false;
+            A.tb1 = burnTime(dvp); A.tb2 = 0; A.tIgn1 = A.tRef + tB - 0.5 * A.tb1; A.tArr = A.tRef + tB;
+            A.ph = PH_READY;
+            setMsg("PLANES DIFFER %.1f DEG - CHANGING PLANE FIRST (%.0f M/S). ENG TWICE", ang, dvp);
+            return;
+        }
+    }
     dk::PlanIn in;
     in.mu = A.mu; in.rMin = A.rMin; in.rc = S.rc; in.vc = S.vc; in.rt = S.rt; in.vt = S.vt;
     in.wp.axis0 = S.dT; in.wp.omega = S.wtG; in.wp.standoff = A.standoff;
@@ -424,7 +437,7 @@ static void planFinished()
     {
         V3 hc = dk::unit(dk::cross(A.S.rc, A.S.vc)), ht = dk::unit(dk::cross(A.S.rt, A.S.vt));
         double pa = acos(dk::clampd(dk::dot(hc, ht), -1, 1)) * DEG2;
-        if (need > 1500.0) {
+        if (need > (std::min)(4000.0, 0.8 * A.C.dvAvail)) {
             A.ph = PH_IDLE; A.plan = dk::Plan();
             setMsg("PLAN TOO EXPENSIVE (%.0f M/S) - ORBIT PLANES DIFFER %.0f DEG", need, pa);
             return;
@@ -653,7 +666,7 @@ static void step(double simt, double dt)
         if (burnVec(v, A.plan.dv1, 0.1)) {
             if (A.circ) {
                 A.circ = false; zeroAll(v); v->ActivateNavmode(NAVMODE_KILLROT);
-                goPhase(PH_IDLE, "ORBIT RAISED - PLANNING DOCKING");
+                goPhase(PH_IDLE, "BURN DONE - RE-PLANNING");
                 startPlan();
                 break;
             }

@@ -35,6 +35,10 @@ bool kepler(const V3 &r0, const V3 &v0, double mu, double dt, V3 &r, V3 &v);
 //  nrev = 0..N, branch = 0 (low-z/"left") or 1 ("right"), only used for nrev >= 1
 bool lambert(const V3 &r1, const V3 &r2, double dt, double mu, int tm, int nrev, int branch, V3 &v1, V3 &v2);
 
+// Plane-change burn at the next orbit-plane intersection (cheapest node). Returns false if unbound / no node.
+bool planeChange(const V3 &rc, const V3 &vc, const V3 &rt, const V3 &vt, double mu, double tMin,
+                 double &tBurn, V3 &vNew, V3 &vBefore, double &angleDeg);
+
 struct Waypoint {                 // point fixed in the target's port frame (standoff along the port axis)
     V3 axis0;                     // port approach direction at t=0 (unit, global)
     V3 omega;                     // target rotation rate vector [rad/s, global]

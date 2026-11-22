@@ -132,6 +132,51 @@ bool lambert(const V3 &r1, const V3 &r2, double dt, double mu, int tm, int nrev,
     return std::isfinite(v1.x + v1.y + v1.z + v2.x + v2.y + v2.z);
 }
 
+bool planeChange(const V3 &rc, const V3 &vc, const V3 &rt, const V3 &vt, double mu, double tMin,
+                 double &tBurn, V3 &vNew, V3 &vBefore, double &angleDeg)
+{
+    V3 hc = unit(cross(rc, vc)), ht = unit(cross(rt, vt));
+    double c = dot(hc, ht); c = c > 1 ? 1 : (c < -1 ? -1 : c);
+    angleDeg = std::acos(c) * 180.0 / PI;
+    V3 nl = cross(hc, ht);
+    if (len(nl) < 1e-9) return false;
+    nl = unit(nl);
+    double E = dot(vc, vc) / 2 - mu / len(rc);
+    if (E >= 0) return false;
+    double a = -mu / (2 * E), P = 2 * PI * std::sqrt(a * a * a / mu);
+    double bestT = -1, bestV = 1e30; V3 bv, br;
+    for (int node = 0; node < 2; node++) {
+        V3 ax = node == 0 ? nl : nl * -1.0;
+        double bd = -2, bt = 0; V3 r, v, rb, vb;
+        for (int i = 0; i <= 720; i++) {
+            double t = tMin + P * i / 720.0;
+            if (!kepler(rc, vc, mu, t, r, v)) continue;
+            double d = dot(unit(r), ax);
+            if (d > bd) { bd = d; bt = t; rb = r; vb = v; }
+        }
+        if (bd < 0.99) continue;
+        // refine around bt
+        double lo = bt - P / 720.0, hi = bt + P / 720.0;
+        for (int it = 0; it < 40; it++) {
+            double m1 = lo + (hi - lo) / 3, m2 = hi - (hi - lo) / 3;
+            V3 r1, v1, r2, v2; kepler(rc, vc, mu, m1, r1, v1); kepler(rc, vc, mu, m2, r2, v2);
+            if (dot(unit(r1), ax) > dot(unit(r2), ax)) hi = m2; else lo = m1;
+        }
+        bt = 0.5 * (lo + hi);
+        if (bt < tMin) bt = tMin;
+        kepler(rc, vc, mu, bt, rb, vb);
+        // rotate about the node line so that the orbit normal becomes ht
+        double dlt = std::atan2(dot(ax, cross(hc, ht)), dot(hc, ht));
+        V3 vn = rotateAbout(vb, ax, dlt);
+        double cost = len(vn - vb);
+        if (bt < bestT || bestT < 0) { /* keep best by speed (cost), prefer the cheaper node */ }
+        if (cost < bestV) { bestV = cost; bestT = bt; bv = vn; br = vb; }
+    }
+    if (bestT < 0) return false;
+    tBurn = bestT; vNew = bv; vBefore = br;
+    return true;
+}
+
 // ----------------------------------------------------------------------------- waypoint
 V3 Waypoint::axisAt(double t) const
 {
