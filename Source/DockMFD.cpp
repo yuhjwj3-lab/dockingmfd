@@ -807,7 +807,7 @@ class DOCK_MFD : public MFD2 {
 public:
     DOCK_MFD(DWORD w, DWORD h, VESSEL *v) : MFD2(w, h, v), page(-1), lastCat(-1), lh(14), x0(6), y(4)
     {
-        font = oapiCreateFont((int)(h / 28), true, "Courier New");
+        font = oapiCreateFont((int)(h / 21), true, "Courier New");
         penR = oapiCreatePen(1, 1, RGB(0, 120, 0)); penG = oapiCreatePen(1, 1, RGB(0, 120, 0));
         penA = oapiCreatePen(1, 1, C_AMBER); penV = oapiCreatePen(1, 2, C_VAL); penRed = oapiCreatePen(1, 1, C_RED);
     }
@@ -824,7 +824,7 @@ public:
     }
     void KV(oapi::Sketchpad *s, const char *k, const char *v, DWORD vc = C_VAL)
     {
-        int cx = (int)(W * 0.42);
+        int cx = (int)(W * 0.46);
         s->SetTextColor(RGB(0, 120, 0)); s->Text(x0, y, k, (int)strlen(k));
         s->SetTextColor(vc); s->Text(cx, y, v, (int)strlen(v)); y += lh;
     }
@@ -838,7 +838,7 @@ public:
         double now = oapiGetSimTime();
         if (now - A.candT > 1.0 || now < A.candT) { A.candT = now; if (A.ph < PH_PLANNING || A.ph == PH_READY) refreshCands(); }
         skp->SetFont(font); skp->SetBackgroundMode(oapi::Sketchpad::BK_TRANSPARENT);
-        lh = (int)(H / 28); x0 = 6; y = 4;
+        lh = (int)(H / 19); x0 = 8; y = 4;
         int pg = ActivePage();
         char b[160];
         skp->SetTextColor(C_ACC2); snprintf(b, 159, "DOCK  %s", PAGES[pg]); skp->Text(x0, y, b, (int)strlen(b));
@@ -853,7 +853,7 @@ public:
         bool bad = strstr(A.msg, "ABORT") || strstr(A.msg, "NO ") || strstr(A.msg, "NOT ") || strstr(A.msg, "LOST") || strstr(A.msg, "TOO ") || strstr(A.msg, "ONLY");
         bool warn = strstr(A.msg, "ENG") || strstr(A.msg, "PRESS");
         skp->SetTextColor(bad ? C_RED : (warn ? C_AMBER : C_VAL));
-        int n = (int)strlen(A.msg); if (n > 62) n = 62;
+        int n = (int)strlen(A.msg); int maxc = (int)((W - 16) / (H / 21.0 * 0.6)); if (n > maxc) n = maxc;
         skp->Text(x0, sy, A.msg, n);
         return true;
     }
@@ -869,7 +869,7 @@ public:
         s->SetTextColor(RGB(0, 120, 0)); const char *h = "  NAME              RANGE     PORTS"; s->Text(x0, y, h, (int)strlen(h)); y += lh;
         s->SetPen(penG); s->Line(0, y, W, y); y += 3;
         int shown = 0;
-        for (size_t i = 0; i < A.cands.size() && shown < 8; i++, shown++) {
+        for (size_t i = 0; i < A.cands.size() && shown < 6; i++, shown++) {
             const Cand &c = A.cands[i]; bool sel = ((int)i == A.cur);
             fmtDist(d, c.dist);
             snprintf(b, 159, "%c %-16.16s %9s  %d/%d", sel ? '>' : ' ', c.name, d, c.nFree, c.nTot);
