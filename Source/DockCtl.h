@@ -86,7 +86,7 @@ inline V3 attitudeControl(const Mat3 &R, const V3 &w, const V3 &Lloc, const V3 &
         double ab = 0.45 * alpha;
         double ae = std::fabs(ev[i]), e0 = 0.02, wd;
         if (ae < e0) wd = ev[i] * std::sqrt(2.0 * ab / e0);
-        else wd = (ev[i] > 0 ? 1.0 : -1.0) * std::min(wmax, std::sqrt(2.0 * ab * ae));
+        else wd = (ev[i] > 0 ? 1.0 : -1.0) * (std::min)(wmax, std::sqrt(2.0 * ab * ae));
         wd = clampd(wd, -wmax, wmax);
         double gi = gcal[i];
         if (std::fabs(gi) < 1e-6) gi = 1e-6;
@@ -115,11 +115,11 @@ inline FunnelOut funnelVelocity(const V3 &rho, const V3 &dT, double alignFactor)
     double vs;
     if (s > 12.0) vs = clampd(0.012 * s, 0.10, 4.0);
     else vs = 0.12;
-    double fun = 0.08 * std::max(s, 0.0) + 0.4;
-    if (L > fun) vs *= clampd(1.0 - (L - fun) / (0.25 * std::max(s, 0.0) + 2.0), 0.0, 1.0);
+    double fun = 0.08 * (std::max)(s, 0.0) + 0.4;
+    if (L > fun) vs *= clampd(1.0 - (L - fun) / (0.25 * (std::max)(s, 0.0) + 2.0), 0.0, 1.0);
     vs *= alignFactor;
-    double vlatMax = std::max(0.05, std::min(1.5, 0.15 * std::max(s, 0.0)));
-    V3 vlat = L > 1e-6 ? latv * (-std::min(0.08 * L, vlatMax) / L) : V3();
+    double vlatMax = (std::max)(0.05, (std::min)(1.5, 0.15 * (std::max)(s, 0.0)));
+    V3 vlat = L > 1e-6 ? latv * (-(std::min)(0.08 * L, vlatMax) / L) : V3();
     o.vDes = dT * (-vs) + vlat;
     o.vs = vs;
     o.inFunnel = (s > 0) && (L < std::tan(35.0 * PI / 180.0) * s + 5.0);
@@ -131,8 +131,8 @@ inline V3 goToVelocity(const V3 &toPt, double vmax, double aAvail)
 {
     double d = len(toPt);
     if (d < 1e-6) return V3();
-    double v = std::min(vmax, std::sqrt(2.0 * 0.3 * aAvail * d));
-    if (d < 5.0) v = std::min(v, 0.2 * d + 0.02);
+    double v = (std::min)(vmax, std::sqrt(2.0 * 0.3 * aAvail * d));
+    if (d < 5.0) v = (std::min)(v, 0.2 * d + 0.02);
     return toPt * (v / d);
 }
 

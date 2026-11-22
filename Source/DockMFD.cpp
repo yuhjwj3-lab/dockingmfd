@@ -6,6 +6,7 @@
 // Flow:  pick target (UP/DN/SEL)  ->  PLN (plan: burn 1, coast, burn 2)  ->  ENG twice (confirm)  ->
 //        calibrate RCS -> burn 1 -> coast with mid-course corrections -> braking burn -> closing -> docking funnel -> docked.
 #define STRICT
+#define NOMINMAX
 #define ORBITER_MODULE
 #include "Orbitersdk.h"
 #include "DrawAPI.h"
@@ -191,7 +192,7 @@ static void computeCaps(VESSEL *v)
             if (ph && std::find(rp.begin(), rp.end(), ph) == rp.end()) rp.push_back(ph);
         }
         c.lin[g] = c.mass > 0 ? f / c.mass : 0;
-        mn = std::min(mn, c.lin[g]);
+        mn = (std::min)(mn, c.lin[g]);
     }
     for (size_t i = 0; i < rp.size(); i++) c.rcsFuel += v->GetPropellantMass(rp[i]);
     c.aLin = mn < 1e8 ? mn : 0;
@@ -214,7 +215,7 @@ static const THGROUP_TYPE LING[6] = { THGROUP_ATT_RIGHT, THGROUP_ATT_LEFT, THGRO
 
 static void applyRCS(VESSEL *v, const V3 &uRot, const V3 &aLinLoc)
 {
-    double rot[6] = { std::max(uRot.x, 0.0), std::max(-uRot.x, 0.0), std::max(uRot.y, 0.0), std::max(-uRot.y, 0.0), std::max(uRot.z, 0.0), std::max(-uRot.z, 0.0) };
+    double rot[6] = { (std::max)(uRot.x, 0.0), (std::max)(-uRot.x, 0.0), (std::max)(uRot.y, 0.0), (std::max)(-uRot.y, 0.0), (std::max)(uRot.z, 0.0), (std::max)(-uRot.z, 0.0) };
     double lin[6] = { 0, 0, 0, 0, 0, 0 };
     const Caps &c = A.C;
     double av[3] = { aLinLoc.x, aLinLoc.y, aLinLoc.z };
@@ -231,7 +232,7 @@ static void applyRCS(VESSEL *v, const V3 &uRot, const V3 &aLinLoc)
         for (DWORD k = 0; k < n; k++) lv[v->GetGroupThruster(LING[i], k)] += lin[i];
     }
     for (std::map<THRUSTER_HANDLE, double>::iterator it = lv.begin(); it != lv.end(); ++it)
-        v->SetThrusterLevel(it->first, std::min(1.0, it->second));
+        v->SetThrusterLevel(it->first, (std::min)(1.0, it->second));
 }
 static void zeroAll(VESSEL *v)
 {
@@ -339,13 +340,13 @@ static void selectTarget()
     A.hCh = v->GetHandle(); A.hTgt = c.h; A.hRef = v->GetGravityRef();
     snprintf(A.tgtName, 39, "%s", c.name);
     VESSEL *t = target();
-    A.cPort = std::max(0, firstFreePort(v)); A.tPort = std::max(0, firstFreePort(t));
+    A.cPort = (std::max)(0, firstFreePort(v)); A.tPort = (std::max)(0, firstFreePort(t));
     if (firstFreePort(v) < 0) { setMsg("YOUR SHIP HAS NO FREE DOCKING PORT"); A.hTgt = NULL; return; }
     A.haveRc = A.haveRt = false; A.wcBody = V3(); A.wtGlobal = V3();
     A.ph = PH_IDLE; A.plan = dk::Plan();
     A.mu = GGRAV * oapiGetMass(A.hRef); A.R = oapiGetSize(A.hRef);
     const ATMCONST *ac = oapiGetPlanetAtmConstants(A.hRef);
-    A.rMin = A.R + (ac ? std::max(90e3, 0.6 * ac->altlimit) : 15e3);
+    A.rMin = A.R + (ac ? (std::max)(90e3, 0.6 * ac->altlimit) : 15e3);
     computeCaps(v);
     setMsg("TARGET %s - PRESS PLN", A.tgtName);
 }
@@ -375,7 +376,7 @@ static void startPlan()
         double E = dk::dot(S.vc, S.vc) / 2 - A.mu / dk::len(S.rc);
         if (E >= 0) { setMsg("NOT IN A BOUND ORBIT - GET INTO ORBIT FIRST"); return; }
         double a = -A.mu / (2 * E); V3 h = dk::cross(S.rc, S.vc);
-        double e = sqrt(std::max(0.0, 1.0 + 2.0 * E * dk::dot(h, h) / (A.mu * A.mu)));
+        double e = sqrt((std::max)(0.0, 1.0 + 2.0 * E * dk::dot(h, h) / (A.mu * A.mu)));
         double rp = a * (1 - e);
         if (rp < A.rMin - 30e3) { setMsg("PERIAPSIS %.0f KM IS TOO LOW - CIRCULARISE FIRST", (rp - A.R) / 1000.0); return; }
     }
@@ -384,7 +385,7 @@ static void startPlan()
     in.wp.axis0 = S.dT; in.wp.omega = S.wtG; in.wp.standoff = A.standoff;
     in.tLead = 240.0;
     in.wTime = A.fast ? 0.004 : 0.0004;
-    in.dvMax = A.C.mainF > 0 ? std::min(6000.0, 0.85 * A.C.dvAvail) : 0.0;
+    in.dvMax = A.C.mainF > 0 ? (std::min)(6000.0, 0.85 * A.C.dvAvail) : 0.0;
     if (in.dvMax < 1.0) { setMsg("NO MAIN-ENGINE DELTA-V AVAILABLE FOR A LONG-RANGE TRANSFER"); return; }
     A.planner.start(in);
     A.ph = PH_PLANNING;
@@ -430,7 +431,7 @@ static bool burnTo(VESSEL *v, const V3 &vReq, double tol)
         if (!A.holdSet) { A.holdD = dk::mulM(S.Rc, A.C.mainAxis); A.holdSet = true; }
         V3 uRot = dk::attitudeControl(S.Rc, S.wc, A.C.mainAxis, A.holdD, false, V3(0, 1, 0), V3(0, 1, 0), A.gcal, 0.1, A.errP, A.errR);
         V3 aLoc = dk::tmulM(S.Rc, dvRem * 0.5);
-        double n = dk::len(aLoc), amax = std::max(0.05, 0.7 * A.C.aLin);
+        double n = dk::len(aLoc), amax = (std::max)(0.05, 0.7 * A.C.aLin);
         if (n > amax) aLoc = aLoc * (amax / n);
         applyRCS(v, uRot, aLoc);
         return false;
@@ -449,8 +450,8 @@ static void nearField(VESSEL *v)
     Snap &S = A.S;
     V3 dT = S.dT;
     double sz = oapiGetSize(A.hTgt);
-    double Rk = std::max(45.0, 1.5 * sz + 25.0);
-    double aAv = std::max(0.02, 0.7 * A.C.aLin);
+    double Rk = (std::max)(45.0, 1.5 * sz + 25.0);
+    double aAv = (std::max)(0.02, 0.7 * A.C.aLin);
     bool nearDock = S.s < 60.0 && S.s > -5.0;
     // required chaser attitude: port direction anti-parallel to the target's, roll aligned
     V3 Dc = dT * -1.0;
@@ -472,7 +473,7 @@ static void nearField(VESSEL *v)
         vDes = f.vDes;
     } else {
         snprintf(A.sub, 39, "REPOSITION");
-        double D = std::min(2000.0, std::max(150.0, 0.5 * S.range));
+        double D = (std::min)(2000.0, (std::max)(150.0, 0.5 * S.range));
         V3 W = dT * D;
         V3 A0 = S.rho, B0 = W;
         V3 AB = B0 - A0;
@@ -597,7 +598,7 @@ static void step(double simt, double dt)
         if (burnTo(v, A.vReq, 0.15)) {
             goPhase(PH_TRANSIT, "COASTING - MID-COURSE CORRECTIONS ARMED");
             v->ActivateNavmode(NAVMODE_KILLROT);
-            A.nextMcc = simt + std::max(300.0, 0.3 * (A.tArr - simt));
+            A.nextMcc = simt + (std::max)(300.0, 0.3 * (A.tArr - simt));
         }
         break;
     case PH_TRANSIT: {
@@ -615,7 +616,7 @@ static void step(double simt, double dt)
                     else { v->DeactivateNavmode(NAVMODE_KILLROT); goPhase(PH_MCC_ORIENT, "ORIENTING FOR CORRECTION"); }
                 }
             }
-            A.nextMcc = simt + std::max(300.0, 0.4 * (A.tArr - simt));
+            A.nextMcc = simt + (std::max)(300.0, 0.4 * (A.tArr - simt));
         }
         break; }
     case PH_MCC_ORIENT: {
@@ -629,7 +630,7 @@ static void step(double simt, double dt)
         break;
     case PH_BRAKE_ORIENT: {
         V3 wp, wv; wpState(A.tArr, wp, wv);
-        V3 vArr, rArr; dk::kepler(S.rc, S.vc, A.mu, std::max(0.0, A.tArr - simt), rArr, vArr);
+        V3 vArr, rArr; dk::kepler(S.rc, S.vc, A.mu, (std::max)(0.0, A.tArr - simt), rArr, vArr);
         V3 dvPred = wv - vArr;
         pointMain(v, dk::unit(dvPred));
         if (simt >= A.tArr - 0.5 * A.tb2) goPhase(PH_BRAKE, "BRAKING BURN");
@@ -647,8 +648,8 @@ static void step(double simt, double dt)
     // time-acceleration governor
     double wa = warpAllowed();
     double cur = oapiGetTimeAcceleration();
-    if (cur > wa + 1e-6) oapiSetTimeAcceleration(std::max(1.0, wa));
-    else if (A.autoWarp && cur < wa * 0.5) oapiSetTimeAcceleration(std::min(wa, 1000.0));
+    if (cur > wa + 1e-6) oapiSetTimeAcceleration((std::max)(1.0, wa));
+    else if (A.autoWarp && cur < wa * 0.5) oapiSetTimeAcceleration((std::min)(wa, 1000.0));
 
     // flight log
     if (simt - A.logT >= 2.0) {
@@ -662,10 +663,10 @@ static double warpAllowed()
 {
     double t = oapiGetSimTime();
     switch (A.ph) {
-    case PH_COAST: return std::max(1.0, (A.tIgn1 - 100.0 - t) / 25.0);
+    case PH_COAST: return (std::max)(1.0, (A.tIgn1 - 100.0 - t) / 25.0);
     case PH_TRANSIT: {
-        double ev = std::min(A.nextMcc, A.tArr - 0.5 * A.tb2 - 120.0);
-        return std::max(1.0, (ev - t) / 25.0); }
+        double ev = (std::min)(A.nextMcc, A.tArr - 0.5 * A.tb2 - 120.0);
+        return (std::max)(1.0, (ev - t) / 25.0); }
     case PH_NEAR: {
         double s = fabs(A.S.s);
         if (A.S.range > 3000.0) return 10.0;

@@ -51,7 +51,7 @@ bool kepler(const V3 &r0, const V3 &v0, double mu, double dt, V3 &r, V3 &v)
         if (std::fabs(dF) < 1e-14) break;
         double dchi = F / dF;
         chi -= dchi;
-        if (std::fabs(dchi) < 1e-9 * std::max(1.0, std::fabs(chi))) break;
+        if (std::fabs(dchi) < 1e-9 * (std::max)(1.0, std::fabs(chi))) break;
         if (it == 79) return false;
     }
     double z = alpha * chi * chi;
@@ -92,7 +92,7 @@ bool lambert(const V3 &r1, const V3 &r2, double dt, double mu, int tm, int nrev,
             psi = 0.5 * (lo + hi);
             double T = tofOf(psi, A, R1, R2, sm, y);
             if (std::isnan(T) || T < dt) lo = psi; else hi = psi;
-            if (hi - lo < 1e-13 * std::max(1.0, std::fabs(psi))) break;
+            if (hi - lo < 1e-13 * (std::max)(1.0, std::fabs(psi))) break;
         }
         psi = 0.5 * (lo + hi);
         double T = tofOf(psi, A, R1, R2, sm, y);
@@ -119,7 +119,7 @@ bool lambert(const V3 &r1, const V3 &r2, double dt, double mu, int tm, int nrev,
             bool tooSmall = T < dt;
             if (branch == 0) { if (tooSmall) hi = psi; else lo = psi; }
             else { if (tooSmall) lo = psi; else hi = psi; }
-            if (hi - lo < 1e-13 * std::max(1.0, std::fabs(psi))) break;
+            if (hi - lo < 1e-13 * (std::max)(1.0, std::fabs(psi))) break;
         }
         psi = 0.5 * (lo + hi);
         double T = tofOf(psi, A, R1, R2, sm, y);
@@ -153,15 +153,15 @@ static double arcMinRadius(const V3 &r1, const V3 &r2, const V3 &v1, double mu, 
     double e2 = 1.0 + 2.0 * E * hh / (mu * mu);
     double e = e2 > 0 ? std::sqrt(e2) : 0;
     double rp = p / (1.0 + e);
-    double base = std::min(R1, R2);
+    double base = (std::min)(R1, R2);
     double cd = dot(r1, r2) / (R1 * R2);
     cd = cd > 1 ? 1 : (cd < -1 ? -1 : cd);
     double th = std::acos(cd);
     if (tm < 0) th = 2 * PI - th;
-    if (nrev >= 1 && E < 0) return std::min(base, rp);
+    if (nrev >= 1 && E < 0) return (std::min)(base, rp);
     double nu1 = std::atan2(std::sqrt(p / mu) * dot(r1, v1), p - R1);
     if (nu1 < 0) nu1 += 2 * PI;
-    if (nu1 + th >= 2 * PI) return std::min(base, rp);
+    if (nu1 + th >= 2 * PI) return (std::min)(base, rp);
     return base;
 }
 
@@ -178,15 +178,15 @@ void Planner::start(const PlanIn &i)
     in = i; done = false; prog = 0; best = Plan(); top.clear();
     double Pc = periodOf(in.rc, in.vc, in.mu), Pt = periodOf(in.rt, in.vt, in.mu);
     if (Pc <= 0 || Pt <= 0) { done = true; return; }
-    double P = std::max(Pc, Pt);
-    double Pmn = std::min(Pc, Pt);
-    ds = in.step > 0 ? in.step : std::min(300.0, std::max(20.0, Pmn / 36.0));
+    double P = (std::max)(Pc, Pt);
+    double Pmn = (std::min)(Pc, Pt);
+    ds = in.step > 0 ? in.step : (std::min)(300.0, (std::max)(20.0, Pmn / 36.0));
     double horizon = in.horizon > 0 ? in.horizon : 3.2 * Pc;
     double tofMax = in.tofMax > 0 ? in.tofMax : 4.5 * P;
     hc = cross(in.rc, in.vc);
     kT0 = (int)std::ceil(in.tLead / ds);
     n0 = (int)(horizon / ds) + 1;
-    int kTmin = std::max(2, (int)std::ceil(std::max(0.2 * std::min(Pc, Pt), 400.0) / ds));
+    int kTmin = (std::max)(2, (int)std::ceil((std::max)(0.2 * (std::min)(Pc, Pt), 400.0) / ds));
     nT = (int)(tofMax / ds) - kTmin + 1;
     tauFirst = kTmin * ds;
     int K = kT0 + n0 + kTmin + nT + 2;
@@ -237,7 +237,7 @@ bool Planner::validate(Plan &p) const
     const int N = 90;
     for (int i = 0; i <= N; i++) {
         if (!kepler(r1, p.v1, in.mu, p.tof * i / N, r, v)) return false;
-        rmin = std::min(rmin, len(r));
+        rmin = (std::min)(rmin, len(r));
     }
     // arrival check
     V3 rt, vt;
@@ -281,7 +281,7 @@ bool Planner::step(double budgetSec)
             iT++;
             if ((++cnt & 7) == 0) {
                 double el = std::chrono::duration<double>(clk::now() - t_start).count();
-                if (el > budgetSec) { prog = (i0 + (double)iT / std::max(1, nT)) / std::max(1, n0); return false; }
+                if (el > budgetSec) { prog = (i0 + (double)iT / (std::max)(1, nT)) / (std::max)(1, n0); return false; }
             }
         }
         iT = 0; i0++;
