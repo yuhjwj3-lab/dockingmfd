@@ -100,6 +100,8 @@ struct Auto {
     double calT = 0, calW0 = 0, calDur = 0;
     // burn
     V3 vReq;                   // target velocity for current burn
+    V3 mccDv, brakeDv, burnDv0, burnD0;
+    double burnAcc = 0; bool burnOn = false; int burnIter = 0;
     V3 holdD;
     bool holdSet = false;
     double burnTol = 0.1;
@@ -419,6 +421,15 @@ static void planFinished()
     A.tArr = A.tRef + p.t0 + p.tof;
     A.ph = PH_READY;
     double need = p.dv1m + p.dv2m;
+    {
+        V3 hc = dk::unit(dk::cross(A.S.rc, A.S.vc)), ht = dk::unit(dk::cross(A.S.rt, A.S.vt));
+        double pa = acos(dk::clampd(dk::dot(hc, ht), -1, 1)) * DEG2;
+        if (need > 1500.0) {
+            A.ph = PH_IDLE; A.plan = dk::Plan();
+            setMsg("PLAN TOO EXPENSIVE (%.0f M/S) - ORBIT PLANES DIFFER %.0f DEG", need, pa);
+            return;
+        }
+    }
     if (need > 0.9 * A.C.dvAvail) setMsg("PLAN NEEDS %.0f M/S - ONLY %.0f AVAILABLE", need, A.C.dvAvail);
     else setMsg("PLAN READY - ENG TWICE TO START");
 }
@@ -457,6 +468,33 @@ static bool burnTo(VESSEL *v, const V3 &vReq, double tol)
     V3 D = dk::unit(dvRem);
     double e = pointMain(v, D);
     if (e < 4.0 / DEG2) mainLevel(v, dk::clampd(dvm / (aMain * 1.0), 0.03, 1.0));
+    else mainLevel(v, 0);
+    return false;
+}
+
+// Burn a given delta-v VECTOR (global). Direction is held fixed in space and the delivered delta-v is measured by
+// integrating the real thrust, so the cut-off does not depend on the (changing) velocity direction during long burns.
+static double burnRemaining() { return dk::len(A.burnDv0) - A.burnAcc; }
+static bool burnVec(VESSEL *v, const V3 &dvVec, double tol)
+{
+    const Snap &S = A.S;
+    if (!A.burnOn) { A.burnOn = true; A.burnDv0 = dvVec; A.burnD0 = dk::unit(dvVec); A.burnAcc = 0; }
+    double m = v->GetMass();
+    VECTOR3 T; v->GetThrustVector(T);
+    V3 Tg = dk::mulM(S.Rc, toV(T));
+    A.burnAcc += dk::dot(Tg, A.burnD0) / m * S.dt;
+    double rem = burnRemaining();
+    if (rem < tol) { zeroAll(v); A.burnOn = false; return true; }
+    double aMain = A.C.mainF / m;
+    if (rem < 1.0 || aMain <= 0) {                       // finish with linear RCS along the burn direction
+        mainLevel(v, 0);
+        V3 uRot = dk::attitudeControl(S.Rc, S.wc, A.C.mainAxis, A.burnD0, false, V3(0, 1, 0), V3(0, 1, 0), A.gcal, 0.1, A.errP, A.errR);
+        double acc = (std::min)(rem * 0.5, (std::max)(0.05, 0.7 * A.C.aLin));
+        applyRCS(v, uRot, dk::tmulM(S.Rc, A.burnD0 * acc));
+        return false;
+    }
+    double e = pointMain(v, A.burnD0);
+    if (e < 6.0 / DEG2) mainLevel(v, dk::clampd(rem / aMain, 0.03, 1.0));
     else mainLevel(v, 0);
     return false;
 }
@@ -545,7 +583,7 @@ static void goPhase(int p, const char *m = NULL)
 {
     A.ph = p;
     if (m) setMsg("%s", m);
-    A.holdSet = false; A.stateAge = 0;
+    A.holdSet = false; A.stateAge = 0; if (p != PH_BRAKE) A.burnOn = false;
     logLine("PHASE -> %s %s", phaseName(p), m ? m : "");
 }
 
@@ -612,7 +650,7 @@ static void step(double simt, double dt)
         if (simt >= A.tIgn1) { A.vReq = A.plan.v1; goPhase(PH_BURN1, "BURN 1"); }
         break; }
     case PH_BURN1:
-        if (burnTo(v, A.vReq, 0.15)) {
+        if (burnVec(v, A.plan.dv1, 0.1)) {
             if (A.circ) {
                 A.circ = false; zeroAll(v); v->ActivateNavmode(NAVMODE_KILLROT);
                 goPhase(PH_IDLE, "ORBIT RAISED - PLANNING DOCKING");
@@ -634,7 +672,7 @@ static void step(double simt, double dt)
             if (mccCompute(dv, A.tArr)) {
                 logLine("MCC dv=%.3f m/s", dk::len(dv));
                 if (dk::len(dv) > 0.15) {
-                    A.vReq = S.vc + dv;
+                    A.mccDv = dv;
                     if (dk::len(dv) < 1.5) { v->DeactivateNavmode(NAVMODE_KILLROT); goPhase(PH_MCC_BURN, "CORRECTION BURN (RCS)"); }
                     else { v->DeactivateNavmode(NAVMODE_KILLROT); goPhase(PH_MCC_ORIENT, "ORIENTING FOR CORRECTION"); }
                 }
@@ -643,24 +681,28 @@ static void step(double simt, double dt)
         }
         break; }
     case PH_MCC_ORIENT: {
-        V3 dvRem = A.vReq - S.vc;
-        pointMain(v, dk::unit(dvRem));
+        pointMain(v, dk::unit(A.mccDv));
         if (A.errP < 3.0 / DEG2 && A.stateAge > 5.0) goPhase(PH_MCC_BURN, "CORRECTION BURN");
         A.stateAge += dt;
         break; }
     case PH_MCC_BURN:
-        if (burnTo(v, A.vReq, 0.1)) { goPhase(PH_TRANSIT, "COASTING"); v->ActivateNavmode(NAVMODE_KILLROT); A.stateAge = 0; }
+        if (burnVec(v, A.mccDv, 0.05)) { goPhase(PH_TRANSIT, "COASTING"); v->ActivateNavmode(NAVMODE_KILLROT); A.stateAge = 0; }
         break;
     case PH_BRAKE_ORIENT: {
         V3 wp, wv; wpState(A.tArr, wp, wv);
         V3 vArr, rArr; dk::kepler(S.rc, S.vc, A.mu, (std::max)(0.0, A.tArr - simt), rArr, vArr);
         V3 dvPred = wv - vArr;
         pointMain(v, dk::unit(dvPred));
+        A.brakeDv = dvPred; A.burnIter = 0;
         if (simt >= A.tArr - 0.5 * A.tb2) goPhase(PH_BRAKE, "BRAKING BURN");
         break; }
     case PH_BRAKE: {
         V3 wp, wv; wpState(simt, wp, wv);
-        if (burnTo(v, wv, 0.4)) { goPhase(PH_NEAR, "CLOSE APPROACH"); }
+        if (burnVec(v, A.burnIter == 0 ? A.brakeDv : (wv - S.vc), 0.2)) {
+            V3 res = wv - S.vc;
+            if (dk::len(res) > 3.0 && A.burnIter < 3) { A.burnIter++; A.brakeDv = res; logLine("BRAKE residual %.2f m/s - burning again", dk::len(res)); }
+            else goPhase(PH_NEAR, "CLOSE APPROACH");
+        }
         break; }
     case PH_NEAR:
         nearField(v);
@@ -677,8 +719,8 @@ static void step(double simt, double dt)
     // flight log
     if (simt - A.logT >= 2.0) {
         A.logT = simt;
-        logLine("t=%.0f ph=%s sub=%s range=%.1f s=%.1f lat=%.1f clos=%.3f eP=%.2f eR=%.2f vrel=%.2f fuelRCS=%.1f warp=%.0f",
-                simt, phaseName(A.ph), A.sub, S.range, S.s, S.lat, S.closing, A.errP * DEG2, A.errR * DEG2, dk::len(S.rhoDot), A.C.rcsFuel, cur);
+        logLine("t=%.0f ph=%s sub=%s range=%.1f s=%.1f lat=%.1f clos=%.3f eP=%.2f eR=%.2f vrel=%.2f fuelRCS=%.1f warp=%.0f burnRem=%.2f",
+                simt, phaseName(A.ph), A.sub, S.range, S.s, S.lat, S.closing, A.errP * DEG2, A.errR * DEG2, dk::len(S.rhoDot), A.C.rcsFuel, cur, A.burnOn ? burnRemaining() : 0.0);
     }
 }
 
