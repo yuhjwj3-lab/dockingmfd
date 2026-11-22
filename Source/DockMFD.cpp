@@ -89,7 +89,7 @@ struct Auto {
     dk::Planner planner;
     dk::Plan plan;
     double tRef = 0;
-    bool closeOnly = false;
+    bool closeOnly = false, circ = false;
     double mu = 0, R = 0, rMin = 0;
     double tIgn1 = 0, tb1 = 0, tb2 = 0, tArr = 0;
     double engArmT = -1e9;
@@ -345,7 +345,7 @@ static void selectTarget()
     A.ph = PH_IDLE; A.plan = dk::Plan();
     A.mu = GGRAV * oapiGetMass(A.hRef); A.R = oapiGetSize(A.hRef);
     const ATMCONST *ac = oapiGetPlanetAtmConstants(A.hRef);
-    A.rMin = A.R + (ac ? (std::max)(90e3, 0.6 * ac->altlimit) : 15e3);
+    A.rMin = A.R + (ac ? 110e3 : 15e3);
     computeCaps(v);
     setMsg("TARGET %s - PRESS PLN", A.tgtName);
 }
@@ -362,7 +362,7 @@ static void startPlan()
     if (!A.C.ok) { setMsg("SHIP HAS NO LINEAR RCS - CANNOT DOCK"); return; }
     if (A.C.mainF <= 0) { setMsg("SHIP HAS NO MAIN ENGINE (RCS-ONLY WORKS ONLY WHEN CLOSE)"); }
     if (!gather(0)) { setMsg("CANNOT READ PORT DATA"); return; }
-    A.closeOnly = false;
+    A.closeOnly = false; A.circ = false;
     const Snap &S = A.S;
     double dist = dk::len(S.rc - S.rt), vrel = dk::len(S.vc - S.vt);
     A.tRef = S.t;
@@ -377,7 +377,25 @@ static void startPlan()
         double a = -A.mu / (2 * E); V3 h = dk::cross(S.rc, S.vc);
         double e = sqrt((std::max)(0.0, 1.0 + 2.0 * E * dk::dot(h, h) / (A.mu * A.mu)));
         double rp = a * (1 - e);
-        if (rp < A.rMin - 30e3) { setMsg("PERIAPSIS %.0f KM IS TOO LOW - CIRCULARISE FIRST", (rp - A.R) / 1000.0); return; }
+        if (rp < A.rMin - 30e3) {                         // raise periapsis automatically at apoapsis
+            double P = 2 * 3.14159265358979 * sqrt(a * a * a / A.mu);
+            double bestR = 0, bestT = 240.0; V3 bR, bV;
+            for (int i = 0; i <= 360; i++) {
+                double tt = 240.0 + P * i / 360.0; V3 r, vv;
+                if (!dk::kepler(S.rc, S.vc, A.mu, tt, r, vv)) continue;
+                if (dk::len(r) > bestR) { bestR = dk::len(r); bestT = tt; bR = r; bV = vv; }
+            }
+            double rpNew = A.rMin + 60e3, ra = bestR;
+            if (rpNew > ra) rpNew = ra;
+            double an = 0.5 * (ra + rpNew), vn = sqrt(A.mu * (2.0 / ra - 1.0 / an));
+            V3 v1n = dk::unit(bV) * vn;
+            dk::Plan pl; pl.valid = true; pl.t0 = bestT; pl.tof = 0; pl.v1 = v1n; pl.dv1 = v1n - bV; pl.dv1m = dk::len(pl.dv1);
+            A.plan = pl; A.circ = true; A.closeOnly = false;
+            A.tb1 = burnTime(pl.dv1m); A.tb2 = 0; A.tIgn1 = A.tRef + bestT - 0.5 * A.tb1; A.tArr = A.tRef + bestT;
+            A.ph = PH_READY;
+            setMsg("ORBIT TOO LOW - WILL RAISE IT FIRST (%.0f M/S). ENG TWICE", pl.dv1m);
+            return;
+        }
     }
     dk::PlanIn in;
     in.mu = A.mu; in.rMin = A.rMin; in.rc = S.rc; in.vc = S.vc; in.rt = S.rt; in.vt = S.vt;
@@ -595,6 +613,12 @@ static void step(double simt, double dt)
         break; }
     case PH_BURN1:
         if (burnTo(v, A.vReq, 0.15)) {
+            if (A.circ) {
+                A.circ = false; zeroAll(v); v->ActivateNavmode(NAVMODE_KILLROT);
+                goPhase(PH_IDLE, "ORBIT RAISED - PLANNING DOCKING");
+                startPlan();
+                break;
+            }
             goPhase(PH_TRANSIT, "COASTING - MID-COURSE CORRECTIONS ARMED");
             v->ActivateNavmode(NAVMODE_KILLROT);
             A.nextMcc = simt + (std::max)(300.0, 0.3 * (A.tArr - simt));
