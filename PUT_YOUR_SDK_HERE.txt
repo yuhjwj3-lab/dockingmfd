@@ -1,0 +1,3 @@
+Copy C:\Orbiter2016\Orbitersdk\include  ->  sdk\include
+Copy C:\Orbiter2016\Orbitersdk\lib      ->  sdk\lib
+(same as you did for ARLC)
