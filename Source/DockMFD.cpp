@@ -1,4 +1,4 @@
-// DOCK MFD for Orbiter 2016: autonomous rendezvous and docking with any other vessel orbiting the same body.
+// ODIN MFD for Orbiter 2016: autonomous rendezvous and docking with any other vessel orbiting the same body.
 //
 // HONEST NOTE: written and tested only OUTSIDE Orbiter (orbital maths and the control laws were run in an offline
 // simulation; the Orbiter glue was only syntax-checked). Expect to need a flight or two of tuning. Send DockMFD_flight.log.
@@ -726,8 +726,7 @@ static void step(double simt, double dt)
     // time-acceleration governor
     double wa = warpAllowed();
     double cur = oapiGetTimeAcceleration();
-    if (cur > wa + 1e-6) oapiSetTimeAcceleration((std::max)(1.0, wa));
-    else if (A.autoWarp && wa > 1.5 && cur < wa * 0.9) oapiSetTimeAcceleration((std::min)(wa, 10000.0));
+    if (A.autoWarp && cur > wa + 1e-6) oapiSetTimeAcceleration((std::max)(1.0, wa));
 
     // flight log
     if (simt - A.logT >= 2.0) {
@@ -841,7 +840,7 @@ public:
         lh = (int)(H / 19); x0 = 8; y = 4;
         int pg = ActivePage();
         char b[160];
-        skp->SetTextColor(C_ACC2); snprintf(b, 159, "DOCK  %s", PAGES[pg]); skp->Text(x0, y, b, (int)strlen(b));
+        skp->SetTextColor(C_ACC2); snprintf(b, 159, "ODIN  %s", PAGES[pg]); skp->Text(x0, y, b, (int)strlen(b));
         skp->SetTextAlign(oapi::Sketchpad::RIGHT);
         skp->SetTextColor(A.ph == PH_ABORT ? C_RED : (A.ph == PH_READY ? C_AMBER : C_VAL));
         skp->Text(W - 6, y, phaseName(A.ph), (int)strlen(phaseName(A.ph)));
@@ -864,7 +863,7 @@ public:
         if (A.hTgt) { snprintf(b, 159, "%d -> %d", A.cPort + 1, A.tPort + 1); KV(s, "PORTS (YOU->TGT)", b); }
         snprintf(b, 159, "%.1f km", A.standoff / 1000.0); KV(s, "STANDOFF", b);
         KV(s, "PLAN STYLE", A.fast ? "FAST (more fuel)" : "ECONOMY (less fuel)");
-        KV(s, "AUTO WARP", A.autoWarp ? "ON" : "OFF", A.autoWarp ? C_VAL : C_AMBER);
+        KV(s, "WARP LIMITER", A.autoWarp ? "ON (you set the warp)" : "OFF", A.autoWarp ? C_VAL : C_AMBER);
         y += 4;
         s->SetTextColor(RGB(0, 120, 0)); const char *h = "  NAME              RANGE     PORTS"; s->Text(x0, y, h, (int)strlen(h)); y += lh;
         s->SetPen(penG); s->Line(0, y, W, y); y += 3;
@@ -924,6 +923,7 @@ public:
         }
         y += 3;
         snprintf(b, 159, "%.0f x", oapiGetTimeAcceleration()); KV(s, "TIME ACCEL", b);
+        { double wsafe = warpAllowed(); if (wsafe > 1e8) snprintf(b, 159, "any"); else snprintf(b, 159, "%.0f x", wsafe); KV(s, "MAX SAFE WARP", b, oapiGetTimeAcceleration() > wsafe ? C_RED : C_VAL); }
         snprintf(b, 159, "%.0f kg", A.C.rcsFuel); KV(s, "RCS FUEL", b);
         snprintf(b, 159, "%.0f m/s", A.C.dvAvail); KV(s, "MAIN DELTA-V", b);
     }
@@ -967,7 +967,7 @@ public:
         case 7: engage(); break;
         case 8: doAbort(); break;
         case 9: if (A.ph < PH_CAL) { A.fast = !A.fast; if (A.ph == PH_READY) A.ph = PH_IDLE; setMsg(A.fast ? "FAST PLANS: MORE DELTA-V, LESS WAITING" : "ECONOMY PLANS: LESS DELTA-V, MORE WAITING"); } break;
-        case 10: A.autoWarp = !A.autoWarp; setMsg(A.autoWarp ? "AUTO TIME-WARP ON" : "AUTO TIME-WARP OFF (STILL LIMITED FOR SAFETY)"); break;
+        case 10: A.autoWarp = !A.autoWarp; setMsg(A.autoWarp ? "WARP LIMITER ON - YOU SET THE WARP, MFD ONLY CAPS IT" : "WARP LIMITER OFF - WATCH YOUR BURNS!"); break;
         case 11: page = (ActivePage() + 1) % 4; break;
         default: return false;
         }
@@ -1001,7 +1001,7 @@ public:
         case 7: return (char *)(oapiGetSimTime() - A.engArmT < 8.0 ? "ENG?" : "ENG");
         case 8: return (char *)"ABT";
         case 9: return (char *)(A.fast ? "FST" : "ECO");
-        case 10: return (char *)(A.autoWarp ? "WRP*" : "WRP");
+        case 10: return (char *)(A.autoWarp ? "LIM*" : "LIM");
         case 11: return (char *)"PG";
         }
         return 0;
@@ -1014,14 +1014,14 @@ public:
             { "Standoff distance", "1 / 2 / 5 km", 0 },
             { "Plan the rendezvous", 0, 'P' }, { "Engage (press twice)", 0, 'E' }, { "Abort - you get control", 0, 'A' },
             { "Plan style", "FAST = more fuel, ECO = more waiting", 0 },
-            { "Auto time-warp", "speeds up the long coasts", 'W' }, { "Next page", 0, 'G' } };
+            { "Warp limiter", "caps warp near burns (you set warp)", 'W' }, { "Next page", 0, 'G' } };
         if (menu) *menu = m; return 12;
     }
     void WriteStatus(FILEHANDLE scn) const
     {
         oapiWriteScenario_float(scn, "STANDOFF", A.standoff);
         oapiWriteScenario_int(scn, "FAST", A.fast ? 1 : 0);
-        oapiWriteScenario_int(scn, "AUTOWARP", A.autoWarp ? 1 : 0);
+        oapiWriteScenario_int(scn, "WARPLIMIT", A.autoWarp ? 1 : 0);
     }
     void ReadStatus(FILEHANDLE scn)
     {
@@ -1029,7 +1029,7 @@ public:
         while (oapiReadScenario_nextline(scn, line)) {
             if (!_strnicmp(line, "STANDOFF ", 9)) A.standoff = dk::clampd(atof(line + 9), 500.0, 10000.0);
             else if (!_strnicmp(line, "FAST ", 5)) A.fast = atoi(line + 5) != 0;
-            else if (!_strnicmp(line, "AUTOWARP ", 9)) A.autoWarp = atoi(line + 9) != 0;
+            else if (!_strnicmp(line, "WARPLIMIT ", 10)) A.autoWarp = atoi(line + 10) != 0;
         }
     }
 private:
@@ -1048,7 +1048,7 @@ static int MsgProc(UINT msg, UINT mfd, WPARAM wp, LPARAM lp)
 
 DLLCLBK void InitModule(HINSTANCE hDLL)
 {
-    static char name[] = "Dock";
+    static char name[] = "ODIN";
     MFDMODESPECEX spec; spec.name = name; spec.key = OAPI_KEY_D; spec.context = NULL; spec.msgproc = MsgProc;
     g_mode = oapiRegisterMFDMode(spec);
 }
