@@ -639,18 +639,22 @@ static bool mccCompute(V3 &dv, double tAbs)
 
 
 // ============================================================================ plane alignment (ALIGN page)
-// parent of a celestial body (the SDK has no direct call): the more massive body that pulls on it hardest
+// parent of a celestial body (the SDK has no direct call): the body whose Hill sphere (sphere of influence) it sits in
 static OBJHANDLE gbodyParent(OBJHANDLE b)
 {
-    double mb = oapiGetMass(b), best = 0; OBJHANDLE par = NULL;
-    for (DWORD i = 0; i < oapiGetGbodyCount(); i++) {
+    double mb = oapiGetMass(b), bestR = 1e300; OBJHANDLE par = NULL;
+    DWORD n = oapiGetGbodyCount();
+    for (DWORD i = 0; i < n; i++) {
         OBJHANDLE o = oapiGetGbodyByIndex(i);
         if (o == b) continue;
         double mo = oapiGetMass(o); if (mo <= mb) continue;
         VECTOR3 d; oapiGetRelativePos(b, o, &d);
         double L = length(d); if (L < 1.0) continue;
-        double a = mo / (L * L);
-        if (a > best) { best = a; par = o; }
+        // Hill radius of o around its own heaviest neighbour (infinite for the Sun)
+        double rH = 1e300, mh = 0; OBJHANDLE hv = NULL;
+        for (DWORD k = 0; k < n; k++) { OBJHANDLE q = oapiGetGbodyByIndex(k); if (q == o) continue; double mq = oapiGetMass(q); if (mq > mo && mq > mh) { mh = mq; hv = q; } }
+        if (hv) { VECTOR3 dd; oapiGetRelativePos(o, hv, &dd); rH = length(dd) * pow(mo / (3.0 * mh), 1.0 / 3.0); }
+        if (L < rH && rH < bestR) { bestR = rH; par = o; }
     }
     return par;
 }
@@ -723,6 +727,7 @@ static void alnRefreshList()
         if (h == hv) continue;
         VESSEL *t = oapiGetVesselInterface(h);
         if (!t || t->GetGravityRef() != ref || (t->GetFlightStatus() & 1)) continue;
+        { VECTOR3 dq; v->GetRelativePos(h, dq); if (length(dq) < 100.0) continue; }          // attached payload / docked parts
         Cand c; c.h = h; snprintf(c.name, 39, "%s", t->GetName()); snprintf(c.cls, 27, "VESSEL"); c.nFree = c.nTot = 0;
         VECTOR3 rp, rv; t->GetRelativePos(ref, rp); t->GetRelativeVel(ref, rv);
         c.vrel = planeAngleDeg(toV(pc), toV(vc), toV(rp), toV(rv));
