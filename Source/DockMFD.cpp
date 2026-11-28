@@ -639,6 +639,22 @@ static bool mccCompute(V3 &dv, double tAbs)
 
 
 // ============================================================================ plane alignment (ALIGN page)
+// parent of a celestial body (the SDK has no direct call): the more massive body that pulls on it hardest
+static OBJHANDLE gbodyParent(OBJHANDLE b)
+{
+    double mb = oapiGetMass(b), best = 0; OBJHANDLE par = NULL;
+    for (DWORD i = 0; i < oapiGetGbodyCount(); i++) {
+        OBJHANDLE o = oapiGetGbodyByIndex(i);
+        if (o == b) continue;
+        double mo = oapiGetMass(o); if (mo <= mb) continue;
+        VECTOR3 d; oapiGetRelativePos(b, o, &d);
+        double L = length(d); if (L < 1.0) continue;
+        double a = mo / (L * L);
+        if (a > best) { best = a; par = o; }
+    }
+    return par;
+}
+
 struct NodeOpt { bool ok = false; double t = 0, dv = 0; V3 vB, vN; };
 
 static double planeAngleDeg(const V3 &rc, const V3 &vc, const V3 &rt, const V3 &vt)
@@ -694,7 +710,7 @@ static void alnRefreshList()
     VECTOR3 pc, vc; v->GetRelativePos(ref, pc); v->GetRelativeVel(ref, vc);
     for (DWORD i = 0; i < oapiGetGbodyCount(); i++) {          // moons / planets that orbit the same body as we do
         OBJHANDLE b = oapiGetGbodyByIndex(i);
-        if (b == ref || oapiGetGbodyParent(b) != ref) continue;
+        if (b == ref || gbodyParent(b) != ref) continue;
         Cand c; c.h = b; oapiGetObjectName(b, c.name, 39); snprintf(c.cls, 27, "BODY"); c.nFree = c.nTot = 0;
         VECTOR3 rp, rv; oapiGetRelativePos(b, ref, &rp); oapiGetRelativeVel(b, ref, &rv);
         c.vrel = planeAngleDeg(toV(pc), toV(vc), toV(rp), toV(rv));
@@ -770,7 +786,7 @@ static void alnPlan()
     if (!alnGather(0)) { setMsg("CANNOT READ SHIP STATE"); return; }
     V3 rt, vt;
     if (!alnTargetState(rt, vt)) { setMsg("TARGET LOST"); return; }
-    if (oapiGetObjectType(A.aln.tgt) != OBJTP_VESSEL && oapiGetGbodyParent(A.aln.tgt) != A.hRef) { setMsg("TARGET DOES NOT ORBIT YOUR BODY"); return; }
+    if (oapiGetObjectType(A.aln.tgt) != OBJTP_VESSEL && gbodyParent(A.aln.tgt) != A.hRef) { setMsg("TARGET DOES NOT ORBIT YOUR BODY"); return; }
     const Snap &S = A.S;
     NodeOpt n[2]; double ang = 0;
     A.aln.ang = planeAngleDeg(S.rc, S.vc, rt, vt);
