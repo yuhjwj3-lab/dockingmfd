@@ -42,12 +42,14 @@ static Mat3 toM(const MATRIX3 &M)
 // ============================================================================ state
 enum Phase {
     PH_IDLE, PH_PLANNING, PH_READY, PH_CAL, PH_COAST, PH_ORIENT1, PH_BURN1, PH_TRANSIT, PH_MCC_ORIENT, PH_MCC_BURN,
-    PH_BRAKE_ORIENT, PH_BRAKE, PH_NEAR, PH_DOCKED, PH_ABORT
+    PH_BRAKE_ORIENT, PH_BRAKE, PH_NEAR, PH_DOCKED, PH_ABORT,
+    PH_ALN_READY, PH_ALN_CAL, PH_ALN_COAST, PH_ALN_ORIENT, PH_ALN_BURN, PH_ALN_DONE
 };
 static const char *phaseName(int p)
 {
     static const char *n[] = { "IDLE", "PLANNING", "PLAN READY", "RCS CHECK", "COAST TO BURN", "ORIENT BURN 1", "BURN 1", "TRANSFER COAST",
-        "ORIENT CORR", "CORRECTION BURN", "ORIENT BRAKE", "BRAKING BURN", "CLOSE APPROACH", "DOCKED", "ABORTED" };
+        "ORIENT CORR", "CORRECTION BURN", "ORIENT BRAKE", "BRAKING BURN", "CLOSE APPROACH", "DOCKED", "ABORTED",
+        "ALIGN READY", "RCS CHECK", "COAST TO NODE", "ORIENT BURN", "PLANE BURN", "ALIGN DONE" };
     return n[p];
 }
 
@@ -117,6 +119,14 @@ struct Auto {
     double stateAge = 0;
     OBJHANDLE capsFor = NULL;
     double dockContactT = -1;
+    struct Aln {
+        bool on = false;
+        OBJHANDLE tgt = NULL; char name[40] = "";
+        std::vector<Cand> list; int cur = 0; double listT = -1e9;
+        int nodeMode = 0;
+        bool have = false; double ang = 0, dv = 0, tBurn = 0, tIgn = 0, tb = 0, nodeAlt = 0, other = 0, otherT = 0;
+        V3 dvVec;
+    } aln;
 } A;
 
 // ============================================================================ helpers
@@ -449,6 +459,7 @@ static void planFinished()
 
 // ============================================================================ control primitives
 static double warpAllowed();
+static void alnStep(double simt, double dt);
 
 // point the main-engine axis along D (unit, global); returns pointing error [rad]
 static double pointMain(VESSEL *v, const V3 &D)
@@ -626,8 +637,220 @@ static bool mccCompute(V3 &dv, double tAbs)
     return have && best < 500.0;
 }
 
+
+// ============================================================================ plane alignment (ALIGN page)
+struct NodeOpt { bool ok = false; double t = 0, dv = 0; V3 vB, vN; };
+
+static double planeAngleDeg(const V3 &rc, const V3 &vc, const V3 &rt, const V3 &vt)
+{
+    V3 hc = dk::unit(dk::cross(rc, vc)), ht = dk::unit(dk::cross(rt, vt));
+    return acos(dk::clampd(dk::dot(hc, ht), -1.0, 1.0)) * DEG2;
+}
+
+// Both orbit-plane intersection points (nodes): time from now, delta-v to rotate our orbit plane onto the target's plane.
+// The burn keeps speed and radius, only the plane turns, so it is a pure rotation of the velocity about the node line.
+static bool alnNodes(const V3 &rc, const V3 &vc, const V3 &rt, const V3 &vt, double mu, double tMin, NodeOpt out[2], double &angDeg)
+{
+    V3 hc = dk::unit(dk::cross(rc, vc)), ht = dk::unit(dk::cross(rt, vt));
+    angDeg = acos(dk::clampd(dk::dot(hc, ht), -1.0, 1.0)) * DEG2;
+    V3 nl = dk::cross(hc, ht);
+    if (dk::len(nl) < 1e-9) return false;
+    nl = dk::unit(nl);
+    double E = dk::dot(vc, vc) / 2 - mu / dk::len(rc);
+    if (E >= 0) return false;
+    double a = -mu / (2 * E), P = 2 * dk::PI * sqrt(a * a * a / mu);
+    const int NS = 1440;
+    for (int node = 0; node < 2; node++) {
+        V3 ax = node == 0 ? nl : nl * -1.0;
+        double bd = -2, bt = tMin; V3 r, v;
+        for (int i = 0; i <= NS; i++) {
+            double t = tMin + P * i / NS;
+            if (!dk::kepler(rc, vc, mu, t, r, v)) continue;
+            double d = dk::dot(dk::unit(r), ax);
+            if (d > bd) { bd = d; bt = t; }
+        }
+        if (bd < 0.9) continue;
+        double lo = bt - P / NS, hi = bt + P / NS;
+        for (int it = 0; it < 40; it++) {
+            double m1 = lo + (hi - lo) / 3, m2 = hi - (hi - lo) / 3; V3 r1, v1, r2, v2;
+            dk::kepler(rc, vc, mu, m1, r1, v1); dk::kepler(rc, vc, mu, m2, r2, v2);
+            if (dk::dot(dk::unit(r1), ax) > dk::dot(dk::unit(r2), ax)) hi = m2; else lo = m1;
+        }
+        bt = 0.5 * (lo + hi); if (bt < tMin) bt = tMin;
+        V3 rb, vb; dk::kepler(rc, vc, mu, bt, rb, vb);
+        double dlt = atan2(dk::dot(ax, dk::cross(hc, ht)), dk::dot(hc, ht));
+        V3 vn = dk::rotateAbout(vb, ax, dlt);
+        out[node].ok = true; out[node].t = bt; out[node].vB = vb; out[node].vN = vn; out[node].dv = dk::len(vn - vb);
+    }
+    return out[0].ok || out[1].ok;
+}
+
+static void alnRefreshList()
+{
+    VESSEL *v = (A.ph >= PH_ALN_CAL && A.ph <= PH_ALN_BURN) ? chaser() : oapiGetFocusInterface();
+    if (!v) return;
+    OBJHANDLE hv = v->GetHandle(), ref = v->GetGravityRef();
+    A.aln.list.clear();
+    VECTOR3 pc, vc; v->GetRelativePos(ref, pc); v->GetRelativeVel(ref, vc);
+    for (DWORD i = 0; i < oapiGetGbodyCount(); i++) {          // moons / planets that orbit the same body as we do
+        OBJHANDLE b = oapiGetGbodyByIndex(i);
+        if (b == ref || oapiGetGbodyParent(b) != ref) continue;
+        Cand c; c.h = b; oapiGetObjectName(b, c.name, 39); snprintf(c.cls, 27, "BODY"); c.nFree = c.nTot = 0;
+        VECTOR3 rp, rv; oapiGetRelativePos(b, ref, &rp); oapiGetRelativeVel(b, ref, &rv);
+        c.vrel = planeAngleDeg(toV(pc), toV(vc), toV(rp), toV(rv));
+        VECTOR3 d; v->GetRelativePos(b, d); c.dist = length(d);
+        A.aln.list.push_back(c);
+    }
+    std::vector<Cand> vs;
+    for (DWORD i = 0; i < oapiGetVesselCount(); i++) {
+        OBJHANDLE h = oapiGetVesselByIndex(i);
+        if (h == hv) continue;
+        VESSEL *t = oapiGetVesselInterface(h);
+        if (!t || t->GetGravityRef() != ref || (t->GetFlightStatus() & 1)) continue;
+        Cand c; c.h = h; snprintf(c.name, 39, "%s", t->GetName()); snprintf(c.cls, 27, "VESSEL"); c.nFree = c.nTot = 0;
+        VECTOR3 rp, rv; t->GetRelativePos(ref, rp); t->GetRelativeVel(ref, rv);
+        c.vrel = planeAngleDeg(toV(pc), toV(vc), toV(rp), toV(rv));
+        VECTOR3 d; v->GetRelativePos(h, d); c.dist = length(d);
+        vs.push_back(c);
+    }
+    std::sort(vs.begin(), vs.end(), [](const Cand &a, const Cand &b) { return a.dist < b.dist; });
+    for (size_t i = 0; i < vs.size() && i < 12; i++) A.aln.list.push_back(vs[i]);
+    if (A.aln.cur >= (int)A.aln.list.size()) A.aln.cur = (int)A.aln.list.size() - 1;
+    if (A.aln.cur < 0) A.aln.cur = 0;
+}
+
+static bool alnGather(double dt)
+{
+    Snap &S = A.S; S.ok = false;
+    VESSEL *v = chaser();
+    if (!v || !A.hRef) return false;
+    VECTOR3 p, q; MATRIX3 M;
+    v->GetRelativePos(A.hRef, p); v->GetRelativeVel(A.hRef, q);
+    S.rc = toV(p); S.vc = toV(q);
+    v->GetRotationMatrix(M); S.Rc = toM(M);
+    S.t = oapiGetSimTime(); S.dt = dt;
+    if (dt > 1e-6) {
+        if (A.haveRc) A.wcBody = dk::bodyRateFromMatrices(A.prevRc, S.Rc, dt);
+        A.prevRc = S.Rc; A.haveRc = true;
+    }
+    S.wc = A.wcBody;
+    S.ok = true;
+    return true;
+}
+
+static bool alnTargetState(V3 &rt, V3 &vt)
+{
+    if (!A.aln.tgt || !A.hRef) return false;
+    VECTOR3 p, q; oapiGetRelativePos(A.aln.tgt, A.hRef, &p); oapiGetRelativeVel(A.aln.tgt, A.hRef, &q);
+    rt = toV(p); vt = toV(q);
+    return true;
+}
+
+static void alnSelect()
+{
+    if (A.ph >= PH_ALN_CAL && A.ph <= PH_ALN_BURN) { setMsg("ABORT FIRST TO CHANGE TARGET"); return; }
+    alnRefreshList();
+    if (A.aln.list.empty()) { setMsg("NOTHING TO ALIGN WITH IN THIS ORBIT"); return; }
+    A.aln.tgt = A.aln.list[A.aln.cur].h; snprintf(A.aln.name, 39, "%s", A.aln.list[A.aln.cur].name);
+    A.aln.have = false; A.ph = PH_IDLE;
+    setMsg("ALIGN WITH %s - PRESS PLN", A.aln.name);
+}
+
+static void alnPlan()
+{
+    VESSEL *v = oapiGetFocusInterface();
+    if (A.ph >= PH_ALN_CAL && A.ph <= PH_ALN_BURN) { setMsg("ALREADY ENGAGED - ABORT FIRST"); return; }
+    if (!A.aln.tgt) { setMsg("SELECT A TARGET FIRST (UP/DN, SEL)"); return; }
+    if (!v || (v->GetFlightStatus() & 1)) { setMsg("SHIP IS LANDED"); return; }
+    A.hCh = v->GetHandle(); A.hRef = v->GetGravityRef();
+    A.mu = GGRAV * oapiGetMass(A.hRef); A.R = oapiGetSize(A.hRef);
+    computeCaps(v);
+    if (A.C.mainF <= 0) { setMsg("SHIP HAS NO MAIN ENGINE"); return; }
+    A.haveRc = false;
+    if (!alnGather(0)) { setMsg("CANNOT READ SHIP STATE"); return; }
+    V3 rt, vt;
+    if (!alnTargetState(rt, vt)) { setMsg("TARGET LOST"); return; }
+    if (oapiGetObjectType(A.aln.tgt) != OBJTP_VESSEL && oapiGetGbodyParent(A.aln.tgt) != A.hRef) { setMsg("TARGET DOES NOT ORBIT YOUR BODY"); return; }
+    const Snap &S = A.S;
+    NodeOpt n[2]; double ang = 0;
+    A.aln.ang = planeAngleDeg(S.rc, S.vc, rt, vt);
+    if (A.aln.ang < 0.05) { A.aln.have = false; A.ph = PH_IDLE; setMsg("ALREADY ALIGNED (%.2f DEG)", A.aln.ang); return; }
+    double tMin = 150.0;
+    for (int pass = 0; pass < 2; pass++) {
+        if (!alnNodes(S.rc, S.vc, rt, vt, A.mu, tMin, n, ang)) { setMsg("NOT IN A BOUND ORBIT OR NO NODE FOUND"); return; }
+        int pick = 0;
+        if (!n[0].ok) pick = 1; else if (n[1].ok) pick = (A.aln.nodeMode == 0) ? (n[1].dv < n[0].dv ? 1 : 0) : (n[1].t < n[0].t ? 1 : 0);
+        double tb = burnTime(n[pick].dv);
+        A.aln.dv = n[pick].dv; A.aln.tb = tb; A.aln.tBurn = S.t + n[pick].t; A.aln.tIgn = A.aln.tBurn - 0.5 * tb;
+        A.aln.dvVec = n[pick].vN - n[pick].vB;
+        int oth = 1 - pick; A.aln.other = n[oth].ok ? n[oth].dv : 0; A.aln.otherT = n[oth].ok ? S.t + n[oth].t : 0;
+        { V3 rb, vb; dk::kepler(S.rc, S.vc, A.mu, n[pick].t, rb, vb); A.aln.nodeAlt = dk::len(rb) - A.R; }
+        if (A.aln.tIgn - S.t >= 150.0) break;
+        tMin = 0.5 * tb + 160.0;
+    }
+    A.aln.have = true; A.ph = PH_ALN_READY;
+    if (A.aln.dv > 0.9 * A.C.dvAvail) setMsg("NEEDS %.0f M/S - ONLY %.0f AVAILABLE", A.aln.dv, A.C.dvAvail);
+    else setMsg("PLAN READY %.1f DEG, %.0f M/S - ENG TWICE", A.aln.ang, A.aln.dv);
+    logLine("ALN plan target=%s ang=%.2f dv=%.1f tBurn=%.0f nodeAlt=%.0f", A.aln.name, A.aln.ang, A.aln.dv, A.aln.tBurn, A.aln.nodeAlt);
+}
+
+static void alnEngage()
+{
+    VESSEL *v = chaser();
+    if (A.ph != PH_ALN_READY || !v) { setMsg("PLAN FIRST"); return; }
+    double now = oapiGetSimTime();
+    if (now - A.engArmT > 8.0) { A.engArmT = now; setMsg("PRESS ENG AGAIN WITHIN 8 S TO CONFIRM"); return; }
+    A.engArmT = -1e9;
+    computeCaps(v);
+    if (A.aln.tIgn - now < 120.0) { setMsg("PLAN TOO OLD - PRESS PLN AGAIN"); return; }
+    if (A.aln.dv > 0.9 * A.C.dvAvail) { setMsg("NOT ENOUGH DELTA-V FOR THIS PLAN"); return; }
+    A.haveRc = false; A.cal = false; A.calAxis = 0; A.calStage = 0; A.calT = 0;
+    logLine("==== ALN ENGAGE target=%s dv=%.1f", A.aln.name, A.aln.dv);
+    goPhase(PH_ALN_CAL, "CHECKING RCS RESPONSE");
+}
+
+static void alnStep(double simt, double dt)
+{
+    if (A.ph == PH_ALN_CAL || A.ph == PH_ALN_COAST || A.ph == PH_ALN_ORIENT || A.ph == PH_ALN_BURN) {
+        VESSEL *v = chaser();
+        if (!v || !alnGather(dt)) { abortAll("VESSEL LOST"); return; }
+        switch (A.ph) {
+        case PH_ALN_CAL:
+            v->DeactivateNavmode(NAVMODE_KILLROT);
+            if (calStep(v)) { goPhase(PH_ALN_COAST, "COASTING TO NODE"); v->ActivateNavmode(NAVMODE_KILLROT); }
+            break;
+        case PH_ALN_COAST:
+            if (simt >= A.aln.tIgn - 100.0) { v->DeactivateNavmode(NAVMODE_KILLROT); goPhase(PH_ALN_ORIENT, "ORIENTING FOR PLANE BURN"); }
+            break;
+        case PH_ALN_ORIENT:
+            pointMain(v, dk::unit(A.aln.dvVec));
+            if (simt >= A.aln.tIgn) goPhase(PH_ALN_BURN, "PLANE CHANGE BURN");
+            break;
+        case PH_ALN_BURN:
+            if (burnVec(v, A.aln.dvVec, 0.1)) {
+                zeroAll(v); v->ActivateNavmode(NAVMODE_KILLROT);
+                V3 rt, vt; double a = -1;
+                if (alnTargetState(rt, vt)) a = planeAngleDeg(A.S.rc, A.S.vc, rt, vt);
+                goPhase(PH_ALN_DONE, "BURN DONE - CHECK RESIDUAL, PLN TO TRIM");
+                logLine("ALN done residual=%.3f deg", a);
+            }
+            break;
+        }
+        double wa = warpAllowed(), cur = oapiGetTimeAcceleration();
+        if (A.autoWarp && cur > wa + 1e-6) oapiSetTimeAcceleration((std::max)(1.0, wa));
+        if (simt - A.logT >= 2.0) {
+            A.logT = simt;
+            logLine("t=%.0f ph=%s burnRem=%.2f eP=%.2f tIgn-t=%.0f warp=%.0f", simt, phaseName(A.ph), A.burnOn ? burnRemaining() : 0.0, A.errP * DEG2, A.aln.tIgn - simt, cur);
+        }
+        return;
+    }
+    if (A.aln.on) alnGather(dt);              // keep the rate estimator warm
+}
+
+
 static void step(double simt, double dt)
 {
+    if ((A.aln.on || A.ph >= PH_ALN_READY) && A.ph != PH_PLANNING) { alnStep(simt, dt); return; }
     // planner time slice
     if (A.ph == PH_PLANNING) {
         if (A.planner.step(0.008)) planFinished();
@@ -751,7 +974,8 @@ static double warpAllowed()
         if (s > 80.0) return 4.0;
         if (s > 25.0) return 2.0;
         return 1.0; }
-    case PH_PLANNING: case PH_READY: case PH_IDLE: case PH_DOCKED: case PH_ABORT: return 1e9;
+    case PH_ALN_COAST: return (std::max)(1.0, (A.aln.tIgn - 100.0 - t) / 10.0);
+    case PH_PLANNING: case PH_READY: case PH_IDLE: case PH_DOCKED: case PH_ABORT: case PH_ALN_READY: case PH_ALN_DONE: return 1e9;
     default: return 1.0;
     }
 }
@@ -777,7 +1001,8 @@ static void engage()
 
 static void doAbort()
 {
-    if (A.ph == PH_IDLE || A.ph == PH_DOCKED) { setMsg("NOTHING TO ABORT"); return; }
+    if (A.ph == PH_ALN_READY || A.ph == PH_ALN_DONE) { A.ph = PH_IDLE; setMsg("ALIGN PLAN CLEARED"); return; }
+    if (A.ph == PH_IDLE || A.ph == PH_DOCKED || A.ph == PH_ABORT) { setMsg("NOTHING TO ABORT"); return; }
     if (A.ph == PH_PLANNING || A.ph == PH_READY) { A.ph = PH_IDLE; setMsg("PLAN CANCELLED"); return; }
     abortAll("ABORTED BY PILOT - YOU HAVE CONTROL");
 }
@@ -800,7 +1025,7 @@ static void fmtTime(char *b, double s)
 }
 
 static const DWORD C_ACC2 = RGB(0, 230, 0);      // accent (rules, header), different from ARLC's all-green look
-static const char *PAGES[4] = { "TARGET", "PLAN", "FLIGHT", "CORRIDOR" };
+static const char *PAGES[5] = { "TARGET", "PLAN", "FLIGHT", "CORRIDOR", "ALIGN" };
 
 class DOCK_MFD : public MFD2 {
 public:
@@ -817,6 +1042,7 @@ public:
     int Category() const { return (A.ph >= PH_CAL && A.ph <= PH_DOCKED) ? 2 : ((A.ph == PH_READY || A.ph == PH_PLANNING) ? 1 : 0); }
     int ActivePage()
     {
+        if (A.aln.on) return 4;
         int cat = Category();
         if (cat != lastCat) { lastCat = cat; page = -1; }
         return page >= 0 ? page : cat;
@@ -835,7 +1061,8 @@ public:
     bool Update(oapi::Sketchpad *skp)
     {
         double now = oapiGetSimTime();
-        if (now - A.candT > 1.0 || now < A.candT) { A.candT = now; if (A.ph < PH_PLANNING || A.ph == PH_READY) refreshCands(); }
+        if (A.aln.on) { if (now - A.aln.listT > 1.0 || now < A.aln.listT) { A.aln.listT = now; alnRefreshList(); } }
+        else if (now - A.candT > 1.0 || now < A.candT) { A.candT = now; if (A.ph < PH_PLANNING || A.ph == PH_READY) refreshCands(); }
         skp->SetFont(font); skp->SetBackgroundMode(oapi::Sketchpad::BK_TRANSPARENT);
         lh = (int)(H / 19); x0 = 8; y = 4;
         int pg = ActivePage();
@@ -846,7 +1073,7 @@ public:
         skp->Text(W - 6, y, phaseName(A.ph), (int)strlen(phaseName(A.ph)));
         skp->SetTextAlign(oapi::Sketchpad::LEFT);
         y += lh + 2; skp->SetPen(penR); skp->Line(0, y, W, y); y += 4;
-        switch (pg) { case 0: PageTarget(skp); break; case 1: PagePlan(skp); break; case 2: PageFlight(skp); break; default: PageCorridor(skp); }
+        switch (pg) { case 0: PageTarget(skp); break; case 1: PagePlan(skp); break; case 2: PageFlight(skp); break; case 4: PageAlign(skp); break; default: PageCorridor(skp); }
         int sy = H - lh - 3;
         skp->SetPen(penR); skp->Line(0, sy - 2, W, sy - 2);
         bool bad = strstr(A.msg, "ABORT") || strstr(A.msg, "NO ") || strstr(A.msg, "NOT ") || strstr(A.msg, "LOST") || strstr(A.msg, "TOO ") || strstr(A.msg, "ONLY");
@@ -859,6 +1086,8 @@ public:
     void PageTarget(oapi::Sketchpad *s)
     {
         char b[160], d[24];
+        Line(s, C_ACC2, "ORBITAL DOCKING &");
+        Line(s, C_ACC2, "INTERCEPT NAVIGATOR");
         KV(s, "TARGET", A.hTgt ? A.tgtName : "(none)", A.hTgt ? C_VAL : C_AMBER);
         if (A.hTgt) { snprintf(b, 159, "%d -> %d", A.cPort + 1, A.tPort + 1); KV(s, "PORTS (YOU->TGT)", b); }
         snprintf(b, 159, "%.1f km", A.standoff / 1000.0); KV(s, "STANDOFF", b);
@@ -868,7 +1097,7 @@ public:
         s->SetTextColor(RGB(0, 120, 0)); const char *h = "  NAME              RANGE     PORTS"; s->Text(x0, y, h, (int)strlen(h)); y += lh;
         s->SetPen(penG); s->Line(0, y, W, y); y += 3;
         int shown = 0;
-        for (size_t i = 0; i < A.cands.size() && shown < 6; i++, shown++) {
+        for (size_t i = 0; i < A.cands.size() && shown < 4; i++, shown++) {
             const Cand &c = A.cands[i]; bool sel = ((int)i == A.cur);
             fmtDist(d, c.dist);
             snprintf(b, 159, "%c %-16.16s %9s  %d/%d", sel ? '>' : ' ', c.name, d, c.nFree, c.nTot);
@@ -927,6 +1156,41 @@ public:
         snprintf(b, 159, "%.0f kg", A.C.rcsFuel); KV(s, "RCS FUEL", b);
         snprintf(b, 159, "%.0f m/s", A.C.dvAvail); KV(s, "MAIN DELTA-V", b);
     }
+    void PageAlign(oapi::Sketchpad *s)
+    {
+        char b[160], d[24];
+        double now = oapiGetSimTime();
+        Line(s, C_ACC2, "ORBIT PLANE ALIGNMENT");
+        KV(s, "ALIGN WITH", A.aln.tgt ? A.aln.name : "(none)", A.aln.tgt ? C_VAL : C_AMBER);
+        VESSEL *v = (A.ph >= PH_ALN_CAL && A.ph <= PH_ALN_BURN) ? chaser() : oapiGetFocusInterface();
+        if (v && A.aln.tgt) {
+            OBJHANDLE ref = v->GetGravityRef(); VECTOR3 p, q, tp, tq; v->GetRelativePos(ref, p); v->GetRelativeVel(ref, q);
+            oapiGetRelativePos(A.aln.tgt, ref, &tp); oapiGetRelativeVel(A.aln.tgt, ref, &tq);
+            double a = planeAngleDeg(toV(p), toV(q), toV(tp), toV(tq));
+            snprintf(b, 159, "%.2f deg", a); KV(s, "REL INCLINATION", b, a < 0.3 ? C_VAL : C_AMBER);
+        }
+        KV(s, "NODE CHOICE", A.aln.nodeMode == 0 ? "CHEAPEST" : "SOONEST");
+        if (A.ph >= PH_ALN_READY && A.aln.have) {
+            fmtTime(d, A.aln.tBurn - now); KV(s, "NODE IN", d, C_AMBER);
+            snprintf(b, 159, "%.0f m/s  (%.0f s)", A.aln.dv, A.aln.tb); KV(s, "PLANE BURN", b, A.aln.dv > 0.9 * A.C.dvAvail ? C_RED : C_VAL);
+            snprintf(b, 159, "%.0f km", A.aln.nodeAlt / 1000.0); KV(s, "ALT AT NODE", b);
+            if (A.aln.other > 0) { fmtTime(d, A.aln.otherT - now); snprintf(b, 159, "%.0f m/s in %s", A.aln.other, d); KV(s, "OTHER NODE", b); }
+            snprintf(b, 159, "%.0f m/s", A.C.dvAvail); KV(s, "MAIN DELTA-V LEFT", b);
+            if (A.burnOn) { snprintf(b, 159, "%.1f m/s", burnRemaining()); KV(s, "BURN REMAINING", b, C_AMBER); }
+        } else {
+            y += 2;
+            s->SetTextColor(RGB(0, 120, 0)); const char *h = "  TARGET           REL INC    RANGE"; s->Text(x0, y, h, (int)strlen(h)); y += lh;
+            s->SetPen(penG); s->Line(0, y, W, y); y += 3;
+            int first = (std::max)(0, (std::min)(A.aln.cur - 3, (int)A.aln.list.size() - 4));
+            for (int i = first; i < (int)A.aln.list.size() && i < first + 4; i++) {
+                const Cand &c = A.aln.list[i]; bool sel = (i == A.aln.cur);
+                fmtDist(d, c.dist);
+                snprintf(b, 159, "%c %-14.14s %6.2f deg %9s", sel ? '>' : ' ', c.name, c.vrel, d);
+                Line(s, sel ? C_AMBER : C_VAL, "%s", b);
+            }
+            if (A.aln.list.empty()) Line(s, C_AMBER, "  nothing to align with here");
+        }
+    }
     void PageCorridor(oapi::Sketchpad *s)
     {
         const Snap &S = A.S;
@@ -953,16 +1217,49 @@ public:
         s->SetTextColor(inside ? C_VAL : C_AMBER);
         const char *m = inside ? "IN CORRIDOR" : "OUTSIDE CORRIDOR"; s->Text(x0, bot - lh, m, (int)strlen(m));
     }
+    bool AlignButton(int bt)
+    {
+        switch (bt) {
+        case 0: if (A.aln.cur > 0) A.aln.cur--; break;
+        case 1: if (A.aln.cur + 1 < (int)A.aln.list.size()) A.aln.cur++; break;
+        case 2: alnSelect(); break;
+        case 3: A.aln.nodeMode = 1 - A.aln.nodeMode; if (A.ph == PH_ALN_READY) A.ph = PH_IDLE; setMsg(A.aln.nodeMode ? "USING THE SOONEST NODE - PRESS PLN" : "USING THE CHEAPEST NODE - PRESS PLN"); break;
+        case 5: ToggleAlign(); break;
+        case 6: alnPlan(); break;
+        case 7: alnEngage(); break;
+        case 8: doAbort(); break;
+        case 10: A.autoWarp = !A.autoWarp; setMsg(A.autoWarp ? "WARP LIMITER ON - YOU SET THE WARP, MFD ONLY CAPS IT" : "WARP LIMITER OFF - WATCH YOUR BURNS!"); break;
+        default: return false;
+        }
+        InvalidateButtons(); InvalidateDisplay();
+        return true;
+    }
+    void ToggleAlign()
+    {
+        if (!A.aln.on) {
+            if (A.ph >= PH_CAL && A.ph < PH_DOCKED) { setMsg("DOCKING IN PROGRESS - ABORT FIRST"); return; }
+            if (A.ph == PH_PLANNING) { setMsg("PLANNING - ABORT FIRST"); return; }
+            A.aln.on = true; A.ph = PH_IDLE; A.aln.have = false; A.aln.listT = -1e9;
+            alnRefreshList();
+            if (!A.aln.tgt && !A.aln.list.empty()) { A.aln.cur = 0; A.aln.tgt = A.aln.list[0].h; snprintf(A.aln.name, 39, "%s", A.aln.list[0].name); }
+            setMsg("ALIGN WITH %s - PRESS PLN", A.aln.name);
+        } else {
+            if (A.ph >= PH_ALN_CAL && A.ph <= PH_ALN_BURN) { setMsg("ALIGN BURN RUNNING - ABORT FIRST"); return; }
+            A.aln.on = false; A.ph = PH_IDLE; setMsg("SELECT A TARGET");
+        }
+        InvalidateButtons(); InvalidateDisplay();
+    }
     bool ConsumeButton(int bt, int ev)
     {
         if (!(ev & PANEL_MOUSE_LBDOWN)) return false;
+        if (A.aln.on || A.ph >= PH_ALN_READY) return AlignButton(bt);
+        if (bt == 5) { ToggleAlign(); return true; }
         switch (bt) {
         case 0: if (A.cur > 0) A.cur--; break;
         case 1: if (A.cur + 1 < (int)A.cands.size()) A.cur++; break;
         case 2: selectTarget(); break;
         case 3: { VESSEL *v = chaser(); if (v && A.ph < PH_CAL) { A.cPort = nextFreePort(v, A.cPort); A.ph = (A.ph == PH_READY) ? PH_IDLE : A.ph; setMsg("YOUR PORT %d - PRESS PLN", A.cPort + 1); } break; }
         case 4: { VESSEL *t = target(); if (t && A.ph < PH_CAL) { A.tPort = nextFreePort(t, A.tPort); A.ph = (A.ph == PH_READY) ? PH_IDLE : A.ph; setMsg("TARGET PORT %d - PRESS PLN", A.tPort + 1); } break; }
-        case 5: if (A.ph < PH_CAL) { A.standoff = (A.standoff < 1500) ? 2000 : (A.standoff < 3000 ? 5000 : 1000); if (A.ph == PH_READY) A.ph = PH_IDLE; } break;
         case 6: startPlan(); break;
         case 7: engage(); break;
         case 8: doAbort(); break;
@@ -985,18 +1282,33 @@ public:
         case OAPI_KEY_A: return ConsumeButton(8, PANEL_MOUSE_LBDOWN);
         case OAPI_KEY_W: return ConsumeButton(10, PANEL_MOUSE_LBDOWN);
         case OAPI_KEY_G: return ConsumeButton(11, PANEL_MOUSE_LBDOWN);
+        case OAPI_KEY_L: return ConsumeButton(5, PANEL_MOUSE_LBDOWN);
+        case OAPI_KEY_N: if (A.aln.on) return ConsumeButton(3, PANEL_MOUSE_LBDOWN); break;
+        case OAPI_KEY_O: if (!A.aln.on && A.ph < PH_CAL) { A.standoff = (A.standoff < 1500) ? 2000 : (A.standoff < 3000 ? 5000 : 1000); if (A.ph == PH_READY) A.ph = PH_IDLE; setMsg("STANDOFF %.0f KM", A.standoff / 1000.0); InvalidateDisplay(); return true; } break;
         }
         return false;
     }
     char *ButtonLabel(int bt)
     {
+        if (A.aln.on || A.ph >= PH_ALN_READY) {
+            switch (bt) {
+            case 0: return (char *)"UP"; case 1: return (char *)"DN"; case 2: return (char *)"SEL";
+            case 3: return (char *)(A.aln.nodeMode ? "NXT" : "CHP");
+            case 5: return (char *)"EXIT";
+            case 6: return (char *)"PLN";
+            case 7: return (char *)(oapiGetSimTime() - A.engArmT < 8.0 ? "ENG?" : "ENG");
+            case 8: return (char *)"ABT";
+            case 10: return (char *)(A.autoWarp ? "LIM*" : "LIM");
+            }
+            return 0;
+        }
         switch (bt) {
         case 0: return (char *)"UP";
         case 1: return (char *)"DN";
         case 2: return (char *)"SEL";
         case 3: return (char *)"PRT";
         case 4: return (char *)"TPT";
-        case 5: return (char *)"STO";
+        case 5: return (char *)"ALN";
         case 6: return (char *)"PLN";
         case 7: return (char *)(oapiGetSimTime() - A.engArmT < 8.0 ? "ENG?" : "ENG");
         case 8: return (char *)"ABT";
@@ -1011,10 +1323,17 @@ public:
         static const MFDBUTTONMENU m[12] = {
             { "Cursor up", 0, 0 }, { "Cursor down", 0, 0 }, { "Select highlighted target", 0, 'S' },
             { "Your docking port", "cycles free ports", 0 }, { "Target docking port", "cycles free ports", 0 },
-            { "Standoff distance", "1 / 2 / 5 km", 0 },
+            { "ALIGN page", "match orbit plane to Moon etc.", 'L' },
             { "Plan the rendezvous", 0, 'P' }, { "Engage (press twice)", 0, 'E' }, { "Abort - you get control", 0, 'A' },
             { "Plan style", "FAST = more fuel, ECO = more waiting", 0 },
             { "Warp limiter", "caps warp near burns (you set warp)", 'W' }, { "Next page", 0, 'G' } };
+        static const MFDBUTTONMENU ma[12] = {
+            { "Cursor up", 0, 0 }, { "Cursor down", 0, 0 }, { "Select highlighted target", 0, 'S' },
+            { "Node choice", "CHP cheapest / NXT soonest", 'N' }, { 0, 0, 0 },
+            { "Leave ALIGN page", 0, 'L' },
+            { "Plan plane change", 0, 'P' }, { "Engage (press twice)", 0, 'E' }, { "Abort / clear plan", 0, 'A' },
+            { 0, 0, 0 }, { "Warp limiter", 0, 'W' }, { 0, 0, 0 } };
+        if (A.aln.on || A.ph >= PH_ALN_READY) { if (menu) *menu = ma; return 12; }
         if (menu) *menu = m; return 12;
     }
     void WriteStatus(FILEHANDLE scn) const
